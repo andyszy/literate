@@ -85,6 +85,23 @@ next sync silently deletes it.
 Note that upstream's own `widgets/Workspaces.qml` is vendored and unused; ours
 is the root-level one. Do not confuse them.
 
+It also defaults `SOURCE_ROOT` to the **installed** Omarchy, which on an Apple
+Silicon machine is omarchy-mac. Running it with that default while
+`main-basecamp` is checked out replaces the basecamp bar with the mac one, and
+nothing complains: the tree still validates and the bar still renders, because
+the machine testing it is a Mac. That has happened once already — see
+`Rebuild the basecamp bar from its own vendor base`. A cheaper tell is that the
+two `main-*` trees go byte-identical, which cannot be right when the vendor
+bases differ by 265 lines.
+
+The script now refuses a mismatch, keying off `appleSiliconHost` in the source
+`Bar.qml` (the defining difference between the bases) against the branch name.
+On a basecamp branch, pass a basecamp checkout explicitly.
+
+**Never fix a cross-branch difference by copying `Bar.qml` from the other
+branch.** The patches land at different line numbers on different bases;
+replay `tools/apply-patches.py` on the branch's own vendor base instead.
+
 ## `bar.foreground` is the *popup* text colour, not the bar's
 
 Two properties, one letter apart, and upstream aliases them at `Bar.qml:65-69`:

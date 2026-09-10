@@ -22,6 +22,38 @@ BAR_DIR="$SOURCE_ROOT/shell/plugins/bar"
   exit 1
 }
 
+# Refuse to vendor the wrong flavour of bar onto a branch.
+#
+# SOURCE_ROOT defaults to the *installed* Omarchy, which on this machine is
+# omarchy-mac. Run with that default while main-basecamp is checked out and it
+# silently replaces the basecamp bar with the mac one -- 259 lines of Apple
+# Silicon notch handling and API drift that basecamp's shell never asked for.
+# That has already happened once, and it is invisible: the tree still validates
+# and the bar still renders here, because here is a Mac.
+#
+# appleSiliconHost is the defining difference between the two bases, so it
+# identifies the flavour without trusting a path or a branch name alone.
+if grep -q appleSiliconHost "$BAR_DIR/Bar.qml" 2>/dev/null; then
+  source_flavour=mac
+else
+  source_flavour=basecamp
+fi
+
+branch=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+case "$branch" in
+*basecamp*) want_flavour=basecamp ;;
+*mac*) want_flavour=mac ;;
+*) want_flavour="" ;;
+esac
+
+if [[ -n $want_flavour && $want_flavour != "$source_flavour" ]]; then
+  echo "sync-upstream: refusing to vendor the $source_flavour bar onto '$branch'." >&2
+  echo "  source: $BAR_DIR" >&2
+  echo "  Pass a matching checkout instead, e.g." >&2
+  echo "    tools/sync-upstream /path/to/$want_flavour-omarchy-checkout" >&2
+  exit 1
+fi
+
 # Vendor everything upstream ships, but keep what this fork owns: our README,
 # our tools, and git's own directory.
 # Anything this fork owns must be listed here: --delete removes every file in
@@ -29,6 +61,7 @@ BAR_DIR="$SOURCE_ROOT/shell/plugins/bar"
 # is silently destroyed by the next sync.
 rsync -a --delete \
   --exclude .git \
+  --exclude .gitignore \
   --exclude README.md \
   --exclude CLAUDE.md \
   --exclude LICENSE \
