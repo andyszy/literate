@@ -23,8 +23,8 @@ FORK_MANIFEST = {
     "name": PLUGIN_NAME,
     "author": "andyszy",
     "description": "Omarchy's bar without the misclick gestures, and workspaces named by a model",
-    "kinds": ["bar", "bar-widget"],
-    "entryPoints": {"bar": "Bar.qml", "barWidget": "Workspaces.qml"},
+    "kinds": ["bar", "bar-widget", "overlay"],
+    "entryPoints": {"bar": "Bar.qml", "barWidget": "Workspaces.qml", "overlay": "Overlay.qml"},
     "barWidget": {
         "displayName": "Literate Workspaces",
         "description": "Workspaces named by a model, with a Phosphor icon each",
@@ -32,6 +32,11 @@ FORK_MANIFEST = {
         "allowMultiple": False,
         "defaultSection": "left",
     },
+    # Without this the overlay's Loader stays inactive until summon() and
+    # then loads asynchronously (shell.qml computePanelEntries/panelLoader),
+    # so the first hold-to-open pays for QML compilation and feels broken.
+    # keepLoaded keeps the Loader active from shell startup.
+    "keepLoaded": True,
 }
 
 

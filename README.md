@@ -5,9 +5,11 @@ and the workspaces say what you are doing on them.
 
     1 ⚙ keybindings   2 </> auth refactor   3 ✉ email   4 ✈ lisbon trip   5
 
-One plugin supplies both. An Omarchy plugin may declare several `kinds`; this
-one declares `bar` and `bar-widget`, so `Bar.qml` draws the bar and
-`Workspaces.qml` fills the workspace slot in it.
+One plugin supplies both, plus a third thing: a hold-to-open action menu for
+whichever workspace you're holding the key on. An Omarchy plugin may declare
+several `kinds`; this one declares `bar`, `bar-widget` and `overlay`, so
+`Bar.qml` draws the bar, `Workspaces.qml` fills the workspace slot, and
+`Overlay.qml` is the menu.
 
 ## Install
 
@@ -67,12 +69,38 @@ and never asked twice. Results are written atomically to
 The widget shows number + icon + name for every workspace, the focused one
 bright, empty ones as just their number.
 
+## The hold-to-open workspace menu
+
+Holding a workspace key (rather than tapping it) opens an action menu for the
+workspace you land on: `Overlay.qml`, summoned with
+`omarchy-shell shell summon literate '{"workspace":"3"}'`. It shows
+immediately — header, then rows — while `bin/literate-workspace-namer
+--suggest` runs in the background for that one workspace; an animated
+progress bar fills the header until the suggestion lands (or fails, or times
+out after ~10s), at which point it's replaced by a "Rename to" row or a short
+inline error. The rest of the rows are available the instant the menu opens.
+
+| Row | Key |
+|---|---|
+| Rename to the suggested name | Enter |
+| Spin group 1 onto another workspace | S |
+| Spin group 2 onto another workspace | Shift+S |
+| Rename manually | R |
+| Close every window on the workspace | Backspace |
+
+Rows are also clickable and arrow-key navigable. Manual rename swaps the
+header for a text field (Enter commits, Escape cancels back to the menu).
+Choosing a spin-out changes the header to "Spin onto which workspace?" — press
+a digit 1-9 to pick the target. Escape backs out of either sub-mode first,
+then closes the menu.
+
 ## Layout
 
 | What | Where |
 |---|---|
 | Bar | `Bar.qml` (vendored from Omarchy, patched) |
 | Workspace widget | `Workspaces.qml` |
+| Hold-to-open action menu | `Overlay.qml` |
 | Daemon | `bin/literate-workspace-namer` (linked to `~/.local/bin`) |
 | Phosphor font + name→codepoint map | `fonts/Phosphor.ttf`, `phosphor-codepoints.json` (1530 icons) |
 | Prompt eval fixture | `fixtures/eval.json` |
