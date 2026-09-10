@@ -181,6 +181,41 @@ def clean_title(title):
     return title
 
 
+# Small words stay lowercase in a workspace name unless they open or close it.
+TITLE_CASE_SMALL_WORDS = {
+    "a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "nor",
+    "of", "on", "or", "the", "to", "vs", "via", "with",
+}
+
+
+def _title_case_word(word, is_edge):
+    """Capitalise one word of a workspace name, unless it's a token the model
+    already gave us a reason not to touch: an all-caps acronym ("AI", "PR"),
+    or something with internal capitals or a digit mixed with letters
+    ("macOS", "iPhone", "k8s") that would be mangled by blind title-casing."""
+    if not word:
+        return word
+    if len(word) >= 2 and word.isupper():
+        return word
+    if any(c.isupper() for c in word[1:]):
+        return word
+    if any(c.isdigit() for c in word) and any(c.isalpha() for c in word):
+        return word
+    lower = word.lower()
+    if not is_edge and lower in TITLE_CASE_SMALL_WORDS:
+        return lower
+    return word[:1].upper() + word[1:].lower()
+
+
+def title_case_name(name):
+    """Title-case a workspace name: capitalise each word, except small words
+    (a, the, of, ...) unless they're the first or last word. Preserves
+    acronyms and tokens with internal caps or digits+letters as-is."""
+    words = name.split(" ")
+    last = len(words) - 1
+    return " ".join(_title_case_word(w, i == 0 or i == last) for i, w in enumerate(words))
+
+
 # ------------------------------------------------------------------ prompting
 
 def system_prompt(max_name_chars):
@@ -194,7 +229,7 @@ Rules
 - Several unrelated windows: name the one the person is most likely working in. Fall back to "browsing" only for a true grab-bag of unrelated pages.
 - Terminal titles from AI coding tools (Claude Code and the like) describe the task in progress; name that task.
 - If a workspace has a "previous" name and the windows still fit it, keep it. Do not rename a workspace just because someone opened a different email or switched tab within the same activity.
-- Names: 1-3 words, lowercase, at most {max_name_chars} characters, no trailing punctuation, no quotes. Every workspace gets a different name.
+- Names: 1-3 words, at most {max_name_chars} characters, no trailing punctuation, no quotes. Every workspace gets a different name.
 - Icon: the Phosphor icon name that best fits the subject, such as {" ".join(ICON_HINTS.split())}. Any Phosphor icon is allowed. Plain names only, no -fill or -bold variants.
 
 Examples
@@ -245,7 +280,7 @@ def suggest_system_prompt(max_name_chars, ask_groups):
             "workspace. A group must leave at least one window behind -- "
             "proposing every window is not a split. Propose more than one "
             "group if there are several distinct sub-topics, or none if "
-            "nothing stands out. Each group needs a short lowercase name in "
+            "nothing stands out. Each group needs a short name in "
             "the same style as the workspace name, a Phosphor icon, and the "
             'list of window indices (from the ones you were given) it covers.'
         )
@@ -258,7 +293,7 @@ def suggest_system_prompt(max_name_chars, ask_groups):
 Each window is given as its index, its window class, and its title. Name the subject of the workspace, never the tool: "email", not "browser"; "auth refactor", not "neovim".
 
 Rules
-- Name: 1-3 words, lowercase, at most {max_name_chars} characters, no trailing punctuation, no quotes.
+- Name: 1-3 words, at most {max_name_chars} characters, no trailing punctuation, no quotes.
 - Icon: the Phosphor icon name that best fits the subject, such as {" ".join(ICON_HINTS.split())}. Any Phosphor icon is allowed. Plain names only, no -fill or -bold variants.
 {groups_rule}
 
@@ -447,8 +482,9 @@ class Namer:
 
     def clean(self, entry):
         """Trust nothing the model said; clamp the name, validate the icon."""
-        name = str(entry.get("name", "")).strip().strip(".\"'").lower()
+        name = str(entry.get("name", "")).strip().strip(".\"'")
         name = re.sub(r"\s+", " ", name)[: self.cfg["max_name_chars"]].strip()
+        name = title_case_name(name)
         icon = str(entry.get("icon", "")).strip().lower().replace("_", "-")
         icon = re.sub(r"^ph[-.]", "", icon)
         icon = re.sub(r"-(fill|bold|light|thin|duotone|regular)$", "", icon)
