@@ -12,6 +12,7 @@ an icon. Results land in a JSON file the bar widget watches.
   literate-workspace-namer                 run as a daemon
   literate-workspace-namer --once          one pass over the live desktop
   literate-workspace-namer --test FIXTURE  name a fixture; print, write nothing
+  literate-workspace-namer --suggest ID    one workspace, one model call; print JSON, write nothing
 """
 
 import json
@@ -76,6 +77,15 @@ RE_APP_SUFFIX = re.compile(
     r"\s*$", re.I)
 
 RE_JSON = re.compile(r"\{.*\}", re.S)
+
+
+def extract_json(raw):
+    """Pull the one JSON object out of a model reply. Shared by the bulk
+    parse() below and --suggest, which wants a differently-shaped object."""
+    m = RE_JSON.search(raw or "")
+    if not m:
+        raise ValueError(f"no JSON in model reply: {(raw or '')[:200]!r}")
+    return json.loads(m.group(0))
 
 # A vocabulary hint, not a whitelist: any of the 1530 Phosphor names validates.
 ICON_HINTS = """envelope chat-circle chats-circle phone video-camera calendar clock timer
@@ -217,6 +227,46 @@ def user_prompt(pending, previous):
     return "\n".join(lines) + "\n\nReply with the JSON object only."
 
 
+def suggest_system_prompt(max_name_chars, ask_groups):
+    """A different question than system_prompt(): that one names a batch of
+    workspaces and remembers previous names; this one looks at ONE workspace
+    right now and additionally asks whether some of its windows are a distinct
+    enough sub-topic to split onto their own workspace."""
+    if ask_groups:
+        groups_rule = (
+            '- Also look for a "spin out" grouping: a subset of the windows '
+            "that share a sub-topic distinct enough to move to its own "
+            "workspace. A group must leave at least one window behind -- "
+            "proposing every window is not a split. Propose more than one "
+            "group if there are several distinct sub-topics, or none if "
+            "nothing stands out. Each group needs a short lowercase name in "
+            "the same style as the workspace name, a Phosphor icon, and the "
+            'list of window indices (from the ones you were given) it covers.'
+        )
+        groups_shape = ',\n  "groups": [{"name": "patio furniture", "icon": "armchair", "indices": [1, 3]}]'
+    else:
+        groups_rule = '- This workspace is too small to split; always return an empty "groups" list.'
+        groups_shape = ',\n  "groups": []'
+    return f"""You look at ONE Hyprland workspace and suggest a new name for it, plus whether any of its windows should split off onto their own workspace.
+
+Each window is given as its index, its window class, and its title. Name the subject of the workspace, never the tool: "email", not "browser"; "auth refactor", not "neovim".
+
+Rules
+- Name: 1-3 words, lowercase, at most {max_name_chars} characters, no trailing punctuation, no quotes.
+- Icon: the Phosphor icon name that best fits the subject, such as {" ".join(ICON_HINTS.split())}. Any Phosphor icon is allowed. Plain names only, no -fill or -bold variants.
+{groups_rule}
+
+Reply with exactly one JSON object and nothing else, shaped like:
+
+{{"name": "auth refactor", "icon": "code"{groups_shape}}}"""
+
+
+def suggest_user_prompt(ws_arg, windows):
+    lines = [f"  {i}: [{w['class']}] {w['title']}" if w["title"] else f"  {i}: [{w['class']}]"
+             for i, w in enumerate(windows)]
+    return f"Workspace {ws_arg}:\n" + "\n".join(lines) + "\n\nReply with the JSON object only."
+
+
 class Namer:
     def __init__(self):
         self.cfg = {**DEFAULTS, **load_json(CONFIG_PATH, {})}
@@ -237,9 +287,12 @@ class Namer:
 
     # ---------------------------------------------------------------- snapshot
 
-    def snapshot(self):
-        """workspace id -> list of (class, title), for real workspaces only."""
-        by_ws = {}
+    def _filtered_clients(self):
+        """Yield (ws, class, title, address) for every window hyprctl reports,
+        after the filtering every caller needs: special/scratchpad workspaces
+        (negative ids) skipped, ignore_classes honoured, titles cleaned and
+        clamped. snapshot() and --suggest both build on this so the rules
+        can't drift apart between them."""
         ignore = {c.lower() for c in self.cfg["ignore_classes"]}
         for c in hyprctl("clients"):
             ws = (c.get("workspace") or {}).get("id")
@@ -249,10 +302,23 @@ class Namer:
             if cls.lower() in ignore:
                 continue
             title = clean_title((c.get("title") or "").strip())[: self.cfg["max_title_chars"]]
+            yield ws, cls, title, c.get("address", "")
+
+    def snapshot(self):
+        """workspace id -> list of (class, title), for real workspaces only."""
+        by_ws = {}
+        for ws, cls, title, _addr in self._filtered_clients():
             by_ws.setdefault(str(ws), []).append((cls, title))
         for wins in by_ws.values():
             wins.sort()
         return by_ws
+
+    def workspace_windows(self, ws_id):
+        """Every (filtered) window on one workspace, in hyprctl's own order,
+        keeping the address -- snapshot() throws that away since naming only
+        needs class+title, but --suggest hands addresses back to the caller."""
+        return [{"address": addr, "class": cls, "title": title}
+                for ws, cls, title, addr in self._filtered_clients() if ws == ws_id]
 
     @staticmethod
     def signature(windows):
@@ -367,10 +433,7 @@ class Namer:
             return json.load(f)["choices"][0]["message"]["content"]
 
     def parse(self, raw):
-        m = RE_JSON.search(raw or "")
-        if not m:
-            raise ValueError(f"no JSON in model reply: {(raw or '')[:200]!r}")
-        data = json.loads(m.group(0))
+        data = extract_json(raw)
         if isinstance(data.get("workspaces"), list):
             return {str(e.get("id")): e for e in data["workspaces"] if isinstance(e, dict)}
         return {str(k): v for k, v in data.items()}  # tolerate the keyed shape too
@@ -470,6 +533,65 @@ class Namer:
             print(f"{ws:>2}  {entry['name']:<18} {entry['icon']:<18}  "
                   + " | ".join(f"[{c}] {t}" for c, t in pending[ws]))
 
+    # ---------------------------------------------------------------- suggest
+
+    def suggest(self, ws_arg):
+        """One workspace, one model call: a fresh name plus any "spin out"
+        groupings worth splitting onto their own workspace. Pure read path --
+        no cache, no state file, no daemon loop. Returns (payload, exit_code)
+        rather than printing/exiting itself, so tests can call it directly."""
+        try:
+            ws_id = int(ws_arg)
+        except ValueError:
+            return {"workspace": ws_arg, "error": "workspace id must be an integer"}, 1
+        try:
+            windows = self.workspace_windows(ws_id)
+        except Exception as e:
+            return {"workspace": ws_arg, "error": f"hyprctl failed: {e}"[:200]}, 1
+        if not windows:
+            return {"workspace": ws_arg, "error": "workspace has no windows"}, 1
+
+        # Groups only make sense once there's something left to leave behind
+        # after spinning windows out; below that, skip asking for them at all.
+        want_groups = len(windows) > 2
+        try:
+            raw = self.ask(suggest_system_prompt(self.cfg["max_name_chars"], want_groups),
+                            suggest_user_prompt(ws_arg, windows))
+            data = extract_json(raw)
+            if not isinstance(data, dict):
+                raise ValueError("model reply was not a JSON object")
+        except Exception as e:
+            return {"workspace": ws_arg, "error": str(e)[:200]}, 1
+
+        cleaned = self.clean(data)
+        if not cleaned:
+            return {"workspace": ws_arg, "error": "model did not return a usable name"}, 1
+
+        groups = []
+        if want_groups:
+            for g in data.get("groups") or []:
+                if not isinstance(g, dict):
+                    continue
+                try:
+                    indices = sorted({int(i) for i in g.get("indices") or []})
+                except (TypeError, ValueError):
+                    continue  # trust nothing the model said
+                if not indices or any(i < 0 or i >= len(windows) for i in indices):
+                    continue  # references a window that doesn't exist
+                if len(indices) >= len(windows):
+                    continue  # not a strict subset -- must leave something behind
+                cg = self.clean(g)
+                if cg:
+                    groups.append({"name": cg["name"], "icon": cg["icon"], "indices": indices})
+
+        return {
+            "workspace": ws_arg,
+            "name": cleaned["name"],
+            "icon": cleaned["icon"],
+            "windows": [{"index": i, **w} for i, w in enumerate(windows)],
+            "groups": groups,
+        }, 0
+
     # ------------------------------------------------------------------ events
 
     def fast_clear_empty_workspaces(self):
@@ -561,5 +683,15 @@ if __name__ == "__main__":
         namer.test(sys.argv[sys.argv.index("--test") + 1])
     elif "--once" in sys.argv:
         namer.run_pass()
+    elif "--suggest" in sys.argv:
+        i = sys.argv.index("--suggest")
+        if i + 1 >= len(sys.argv):
+            sys.exit("--suggest requires a workspace id")
+        try:
+            payload, code = namer.suggest(sys.argv[i + 1])
+        except Exception as e:  # a bug here must still exit clean, never a traceback
+            payload, code = {"workspace": sys.argv[i + 1], "error": str(e)[:200]}, 1
+        print(json.dumps(payload, separators=(",", ":")))
+        sys.exit(code)
     else:
         namer.listen_forever()
