@@ -24,9 +24,14 @@ BAR_DIR="$SOURCE_ROOT/shell/plugins/bar"
 
 # Vendor everything upstream ships, but keep what this fork owns: our README,
 # our tools, and git's own directory.
+# Anything this fork owns must be listed here: --delete removes every file in
+# the destination that upstream does not ship, so an unlisted fork-owned file
+# is silently destroyed by the next sync.
 rsync -a --delete \
   --exclude .git \
   --exclude README.md \
+  --exclude CLAUDE.md \
+  --exclude LICENSE \
   --exclude tools \
   "$BAR_DIR/" "$REPO_ROOT/"
 
