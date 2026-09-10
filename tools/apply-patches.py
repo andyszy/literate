@@ -95,6 +95,40 @@ def remove_gesture_area(src: str) -> str:
     return src[:start] + src[end:]
 
 
+def unbind_panel_foreground(src: str) -> str:
+    """Stop the surfaces the bar spawns from inheriting the bar's text colour.
+
+    `bar.foreground` is read only by things the bar *spawns* -- every panel's
+    body text (audio, network, bluetooth, power, monitor, weather, clock,
+    agents), PanelSlider, the tray menu. The bar's own chrome never reads it;
+    widgets take `barForeground` via WidgetButton. Upstream aliases the two,
+    which holds only while the bar and its popups share a background. Pin the
+    bar to black over a light theme -- `[bar] text` in
+    ~/.config/omarchy/shell.toml -- and every panel paints white text on a
+    white `[popups]` card.
+
+    Cost: widgets/Tray.qml reads the same property to colorize *symbolic*
+    tray icons drawn on the bar, so those now follow the popup colour. That
+    is upstream conflating two roles in one property; nothing else on the bar
+    is affected.
+    """
+    upstream = "  property color foreground: themeForeground\n"
+    patched = (
+        "  // Read by the surfaces the bar spawns -- panel body text, the tray\n"
+        "  // menu -- never by the bar's own chrome, which takes barForeground.\n"
+        "  // Upstream aliases this to Color.bar.text, which only holds while the\n"
+        "  // bar and its popups share a background; a bar pinned to black over a\n"
+        "  // light theme then paints white text on white popup cards. Bind it to\n"
+        "  // the popup surface's own text colour instead.\n"
+        "  property color foreground: Color.popups.text\n"
+    )
+    if patched in src:
+        return src  # already patched
+    if upstream not in src:
+        sys.exit("`property color foreground: themeForeground` no longer has the expected shape")
+    return src.replace(upstream, patched, 1)
+
+
 def main() -> None:
     root = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
     patch_manifest(root / "manifest.json")
@@ -103,6 +137,7 @@ def main() -> None:
     src = original = bar.read_text()
     src = unrequire_injected_properties(src)
     src = remove_gesture_area(src)
+    src = unbind_panel_foreground(src)
     if src != original:
         bar.write_text(src)
     print(f"patched {root}")

@@ -65,7 +65,13 @@ Item {
   property color themeForeground: Color.bar.text
   property color themeContrastForeground: Color.background
   property color transparentForeground: Color.bar.text
-  property color foreground: themeForeground
+  // Read by the surfaces the bar spawns -- panel body text, the tray
+  // menu -- never by the bar's own chrome, which takes barForeground.
+  // Upstream aliases this to Color.bar.text, which only holds while the
+  // bar and its popups share a background; a bar pinned to black over a
+  // light theme then paints white text on white popup cards. Bind it to
+  // the popup surface's own text colour instead.
+  property color foreground: Color.popups.text
   property color barForeground: useTransparentForeground ? transparentForeground : themeForeground
   property bool foregroundAnimationEnabled: true
   property color background: Color.bar.background
