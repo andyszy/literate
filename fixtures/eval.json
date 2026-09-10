@@ -1,0 +1,22 @@
+{
+  "_comment": "workspace id -> [[class, title], ...]. Titles are given as Hyprland reports them; the daemon strips app suffixes itself.",
+  "1": [["google-chrome", "Gmail - Google Chrome"]],
+  "2": [["google-chrome", "Inbox (1,432) - andy@gmail.com - Gmail - Google Chrome"],
+        ["google-chrome", "Re: Q3 invoice - andy@gmail.com - Gmail - Google Chrome"]],
+  "3": [["foot", "✳ Shift-Super-A window behavior"]],
+  "4": [["foot", "◑ Chromium tab bar and omarchy window management"],
+        ["foot", "✳ Claude Code"]],
+  "5": [["google-chrome", "Claude - Google Chrome"],
+        ["google-chrome", "Distill Chrome Extension - Monitor Website Changes - Google Chrome"],
+        ["google-chrome", "ONE - Google Chrome"],
+        ["google-chrome", "THREE - Google Chrome"]],
+  "6": [["google-chrome", "Flights from LIS to LHR | Google Flights - Google Chrome"],
+        ["google-chrome", "Lisbon hotels - Booking.com - Google Chrome"]],
+  "7": [["Slack", "#eng-platform - Acme - Slack"],
+        ["google-chrome", "RFC: auth token rotation - Google Docs - Google Chrome"]],
+  "8": [["foot", "nvim ~/src/omarchy/shell/plugins/bar/Bar.qml"],
+        ["foot", "andy@mac:~/src/omarchy"]],
+  "9": [["Spotify", "Spotify Premium"]],
+  "10": [["org.gnome.Nautilus", "Downloads"],
+         ["Alacritty", "yay -S ttf-phosphor-icons"]]
+}

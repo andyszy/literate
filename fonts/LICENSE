@@ -1,12 +1,6 @@
 MIT License
 
-Copyright (c) David Heinemeier Hansson and the Omarchy contributors
-Copyright (c) 2026 Andy Szybalski
-
-This project vendors Omarchy's bar and derives its workspace widget from
-Omarchy's Workspaces widget, both copyright the Omarchy contributors, MIT
-licensed. The bundled Phosphor icon font is copyright Phosphor Icons, MIT
-licensed; see fonts/LICENSE.
+Copyright (c) 2020-2021 Phosphor Icons
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

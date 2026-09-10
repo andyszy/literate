@@ -33,6 +33,11 @@ rsync -a --delete \
   --exclude CLAUDE.md \
   --exclude LICENSE \
   --exclude tools \
+  --exclude Workspaces.qml \
+  --exclude phosphor-codepoints.json \
+  --exclude fonts \
+  --exclude bin \
+  --exclude fixtures \
   "$BAR_DIR/" "$REPO_ROOT/"
 
 python3 "$REPO_ROOT/tools/apply-patches.py" "$REPO_ROOT"

@@ -1,8 +1,44 @@
 # Literate Bar
 
-The Omarchy status bar with the empty-bar click gestures removed.
+Omarchy's status bar, with two changes: the empty-bar click gestures are gone,
+and the workspaces say what you are doing on them.
 
-Upstream's bar treats the blank stretch between widgets as a control surface:
+    1 ⚙ keybindings   2 </> auth refactor   3 ✉ email   4 ✈ lisbon trip   5
+
+One plugin supplies both. An Omarchy plugin may declare several `kinds`; this
+one declares `bar` and `bar-widget`, so `Bar.qml` draws the bar and
+`Workspaces.qml` fills the workspace slot in it.
+
+## Install
+
+```bash
+omarchy plugin add https://github.com/andyszy/literate-bar.git --enable
+~/.config/omarchy/plugins/literate.bar/tools/install
+```
+
+`tools/install` creates a venv with the Anthropic SDK, links the daemon into
+`~/.local/bin`, and prints the autostart line for you to paste. It edits
+nothing behind your back.
+
+Then give the daemon a credential: an API key in
+`~/.config/literate-workspaces/api-key` (chmod 600, scoped to this daemon),
+`ANTHROPIC_API_KEY` in the session environment, or `ant auth login`.
+
+Confirm the bar took:
+
+```bash
+hyprctl layers | grep omarchy-bar     # the layer should be present
+hyprctl monitors | grep reserved      # e.g. "reserved: 0 32 0 0" for a top bar
+```
+
+Update with `omarchy plugin update literate.bar`. Remove with
+`omarchy plugin remove literate.bar`. The shell gates the active bar on the
+plugin still being installed, so removal falls straight back to the built-in
+bar; `bar.id` stays in `shell.json` as a harmless leftover.
+
+## What changed in the bar
+
+Upstream treats the blank stretch between widgets as a control surface:
 
 - **double-click** toggles `bar.transparent`, and persists it to `shell.json`
 - **drag** (or press-and-hold, then drag) moves the bar to the nearest screen
@@ -16,40 +52,86 @@ says and nothing but an edit can change it.
 Dragging individual *widgets* to rearrange them still works — that is a
 separate handler and is untouched.
 
-## Install
+## What the workspace names do
 
-```bash
-omarchy plugin add https://github.com/andyszy/literate-bar.git --enable
+`bin/literate-workspace-namer` sits on Hyprland's event socket. Window
+open/close/move/title events reset a 3 s debounce; when things settle it
+snapshots `hyprctl clients`, strips app-name suffixes from titles
+(`Gmail - Google Chrome` → `Gmail`) so the model sees the subject rather than
+the tool, and for any workspace whose window set changed asks the model for a
+name and an icon — feeding it the previous name so it doesn't flap between
+"email" and "q3 invoice" on every tab switch. Identical window sets are cached
+and never asked twice. Results are written atomically to
+`~/.local/state/literate-workspaces/workspaces.json`, which the widget watches.
+
+The widget shows number + icon + name for every workspace, the focused one
+bright, empty ones as just their number.
+
+## Layout
+
+| What | Where |
+|---|---|
+| Bar | `Bar.qml` (vendored from Omarchy, patched) |
+| Workspace widget | `Workspaces.qml` |
+| Daemon | `bin/literate-workspace-namer` (linked to `~/.local/bin`) |
+| Phosphor font + name→codepoint map | `fonts/Phosphor.ttf`, `phosphor-codepoints.json` (1530 icons) |
+| Prompt eval fixture | `fixtures/eval.json` |
+| Daemon config (optional) | `~/.config/literate-workspaces/config.json` |
+| State, cache, log | `~/.local/state/literate-workspaces/` |
+| SDK venv | `~/.local/share/literate-workspaces/venv` |
+
+## Tuning
+
+Widget settings go on the `literate.bar` entry in `bar.layout`. That is the
+same id that `bar.id` uses to select the bar — one plugin, one id, two roles.
+It looks odd and is correct; `omarchy.menu` does the same thing.
+
+```json
+{ "id": "literate.bar", "showNames": "all", "gap": 1.0, "accentFocused": false }
 ```
 
-Then confirm it took:
+- `showNames`: `all` (default) / `focused` / `never`
+- `gap`: space between workspaces (and before the first), in em
+- `accentFocused`: paint the focused workspace in the bar's active colour
 
-```bash
-hyprctl layers | grep omarchy-bar     # the layer should be present
+Daemon settings, `~/.config/literate-workspaces/config.json` (all optional):
+
+```json
+{
+  "backend": "auto",
+  "model": "claude-haiku-4-5",
+  "api_key_file": "~/.config/literate-workspaces/api-key",
+  "debounce": 3.0,
+  "max_name_chars": 18,
+  "ignore_classes": ["1password"]
+}
 ```
 
-Remove it with `omarchy plugin remove literate.bar`. The shell gates the
-active bar on the plugin still being installed, so it falls straight back to
-the built-in bar; `bar.id` stays in `shell.json` as a harmless leftover.
+Backends: `auto` (default — the API when a credential can be found, else
+`claude-cli`), `api`, `claude-cli` (`claude -p` on your Claude Code login; no
+key needed but ~4 s a call), `local` (any OpenAI-compatible endpoint such as
+`llama-server`; set `local_url` and `local_model` — keeps window titles on the
+machine).
 
-## Sibling project: Literate Workspaces
-
-[Literate Workspaces](https://github.com/andyszy/literate-workspaces) replaces
-the numbered workspace indicators with a Phosphor icon and a short name per
-workspace, chosen by a model from the windows open there; hold Super and the
-icons turn back into numbers. It is a separate plugin so each project tracks
-its own upstream, but the two are meant to be used together:
+## Testing the prompt
 
 ```bash
-omarchy plugin add https://github.com/andyszy/literate-bar.git --enable
-omarchy plugin add https://github.com/andyszy/literate-workspaces.git --enable
+literate-workspace-namer --test ~/.config/omarchy/plugins/literate.bar/fixtures/eval.json
+literate-workspace-namer --once      # one pass over the live desktop
+tail -f ~/.local/state/literate-workspaces/daemon.log
 ```
+
+## Privacy
+
+Window classes and titles for every workspace go to the model. Titles can
+carry email subjects, document names, URLs. Use `ignore_classes` to keep an
+app out entirely, or the `local` backend to keep everything on the machine.
 
 ## Which branch you want
 
-The Omarchy bar is vendored, not subclassed — QML gives no way to reach into a
-nested component and delete a gesture from outside. So this repo carries a full
-copy of the bar, and the copy has to match the shell it runs against: `Bar.qml`
+The bar is vendored, not subclassed — QML gives no way to reach into a nested
+component and delete a gesture from outside. So this repo carries a full copy
+of the bar, and the copy has to match the shell it runs against: `Bar.qml`
 imports `Style`, `Color` and `BarModel` from the host, and those drift between
 releases.
 
@@ -75,8 +157,8 @@ git clone -b main-basecamp https://github.com/andyszy/literate-bar.git \
 omarchy plugin enable literate.bar
 ```
 
-If neither branch matches your Omarchy, re-vendor from your own install —
-see below.
+The workspace widget is identical on every branch; only the vendored bar
+differs.
 
 ## The patches
 
@@ -110,13 +192,12 @@ git checkout main-mac && git merge upstream-mac
 ```
 
 `tools/sync-upstream` re-vendors every file upstream ships, preserving the
-files this fork owns (`README.md`, `CLAUDE.md`, `LICENSE`, `tools/`), then
-re-applies the patches. It rsyncs `--delete`, so a new fork-owned file must be
-added to its `--exclude` list or the next sync deletes it. Repeat for
-`upstream-basecamp` / `main-basecamp`.
+files this fork owns, then re-applies the patches. It rsyncs `--delete`, so a
+new fork-owned file must be added to its `--exclude` list or the next sync
+deletes it.
 
 ## Credit and license
 
-All of the interesting code is Omarchy's, by DHH and the Omarchy contributors,
-MIT licensed. This fork is three small patches on top; the upstream license and
-copyright carry over unchanged.
+The bar and the workspace widget both derive from Omarchy, by DHH and the
+Omarchy contributors, MIT licensed. Icons are
+[Phosphor](https://phosphoricons.com) (MIT). See `LICENSE`.
