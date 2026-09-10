@@ -131,7 +131,8 @@ Daemon settings, `~/.config/literate/config.json` (all optional):
   "api_key_file": "~/.config/literate/api-key",
   "debounce": 3.0,
   "max_name_chars": 18,
-  "ignore_classes": ["1password"]
+  "ignore_classes": ["1password"],
+  "chrome_urls": "domain"
 }
 ```
 
@@ -140,6 +141,19 @@ Backends: `auto` (default — the API when a credential can be found, else
 key needed but ~4 s a call), `local` (any OpenAI-compatible endpoint such as
 `llama-server`; set `local_url` and `local_model` — keeps window titles on the
 machine).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `chrome_urls` | `"domain"` | How much of a Chrome window's URL the model sees, when the [literate-tabs extension](../../chrome-extensions/literate-tabs) is installed and reporting: `"domain"` sends only the registrable host (`mail.google.com`), never the path or query; `"full"` sends the whole URL; `"off"` sends nothing. Chrome's window title is always just the active tab's title — never the URL — so without the extension there is nothing to enrich and this key has no effect. |
+
+Chrome URLs never reach the daemon on their own: the `literate-tabs` Chrome
+extension has to be installed and reporting (see
+`~/.config/omarchy/chrome-extensions/README.md`), which writes
+`~/.local/state/literate/chrome-tabs.json`. The daemon reads it only if it's
+fresh (under 5 minutes old) and matches each Chrome window to a reported one
+by title — the only thing the two sides share. A window that can't be matched
+unambiguously (a tie on either side, or no report at all) just keeps its
+plain title, exactly like before this existed.
 
 ## Testing the prompt
 
@@ -154,6 +168,14 @@ tail -f ~/.local/state/literate/daemon.log
 Window classes and titles for every workspace go to the model. Titles can
 carry email subjects, document names, URLs. Use `ignore_classes` to keep an
 app out entirely, or the `local` backend to keep everything on the machine.
+
+With the `literate-tabs` Chrome extension installed, Chrome windows can also
+send URL information — see `chrome_urls` above. It defaults to `"domain"`
+(host only, never a path or query) precisely because a full URL can carry
+plenty on its own: search terms, document IDs, session tokens in a query
+string. Set `chrome_urls` to `"off"` to opt back out entirely, or don't
+install the extension at all — the daemon works exactly as it did before
+without it.
 
 ## Which branch you want
 

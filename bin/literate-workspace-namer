@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 HOME = Path.home()
@@ -47,6 +48,16 @@ CACHE_PATH = STATE_DIR / "cache.json"
 # Kept apart from STATE_PATH because that file is rewritten wholesale every
 # pass -- a pin stored inside it would be gone the next time the model runs.
 PINNED_PATH = STATE_DIR / "pinned.json"
+# Written by the literate-tabs Chrome extension's native-messaging host
+# (~/.config/omarchy/chrome-extensions/literate-tabs-host), not by this
+# daemon -- read-only from here.
+CHROME_TABS_PATH = STATE_DIR / "chrome-tabs.json"
+# The extension only pushes on tab/window events, so a killed or disabled
+# extension leaves a file that otherwise looks fine forever. Time it out
+# ourselves rather than trust it indefinitely.
+CHROME_TABS_MAX_AGE = 300
+CHROME_CLASSES = {"google-chrome", "google-chrome-beta", "google-chrome-unstable",
+                   "chromium", "chromium-browser"}
 
 DEFAULTS = {
     # auto | api | claude-cli | local. auto = the API whenever a credential
@@ -65,6 +76,10 @@ DEFAULTS = {
     "max_name_chars": 18,
     # window classes left out of what the model sees
     "ignore_classes": [],
+    # how much of a matched Chrome window's URL the model gets to see:
+    # "domain" (host only, e.g. "mail.google.com"), "full" (the whole URL),
+    # or "off" (none). Privacy-sensitive -- default stays the narrow one.
+    "chrome_urls": "domain",
     # backend=local: any OpenAI-compatible /v1/chat/completions endpoint
     "local_url": "http://127.0.0.1:8080/v1/chat/completions",
     "local_model": "local",
@@ -308,6 +323,98 @@ def suggest_user_prompt(ws_arg, windows):
     return f"Workspace {ws_arg}:\n" + "\n".join(lines) + "\n\nReply with the JSON object only."
 
 
+# -------------------------------------------------------------- chrome tabs
+#
+# Hyprland's window title for a Chrome window is always the *active tab's*
+# title -- Chrome never puts the URL in the OS window title -- so the daemon
+# can't see URLs on its own. The literate-tabs extension (see
+# ~/.config/omarchy/chrome-extensions/literate-tabs) pushes each window's
+# tab list to a native-messaging host, which writes it here. This section
+# reads that file and lines its windows up with Hyprland's, by title -- the
+# only thing the two sides share -- so the model can be told more than the
+# active tab's bare title.
+
+def load_chrome_tabs(path=CHROME_TABS_PATH, max_age=CHROME_TABS_MAX_AGE, now=None):
+    """The extension's last-reported list of Chrome windows, or None if the
+    file is missing, unreadable, malformed, or older than max_age. Stale
+    data is worse than none: a window that has since closed or navigated
+    would otherwise go on "matching" forever."""
+    data = load_json(path, None)
+    if not isinstance(data, dict):
+        return None
+    updated = data.get("updatedAt")
+    if not isinstance(updated, (int, float)):
+        return None
+    if (now if now is not None else time.time()) - updated > max_age:
+        return None
+    windows = data.get("windows")
+    return windows if isinstance(windows, list) else None
+
+
+def registrable_domain(url):
+    """Host only -- no path, query, fragment, or credentials. This backs
+    chrome_urls="domain", the default and the privacy-safe option."""
+    try:
+        from urllib.parse import urlsplit
+        return urlsplit(url).hostname or ""
+    except Exception:
+        return ""
+
+
+def match_chrome_windows(hypr_titles, chrome_windows):
+    """hypr_titles: [(index, title), ...] for this pass's Chrome-class
+    Hyprland windows. chrome_windows: the "windows" list from
+    chrome-tabs.json. Returns {index: chrome_window_dict} for the pairs that
+    match unambiguously.
+
+    Title is the only thing a Hyprland window and an extension-reported
+    window share -- there is no window-handle correlation available -- so a
+    title that isn't unique on *either* side (two windows genuinely showing
+    the same active tab title, e.g. two blank "New Tab" windows) can't be
+    told apart and is left unmatched rather than guessed at.
+    """
+    hypr_counts = Counter(title for _, title in hypr_titles)
+    chrome_counts = Counter()
+    chrome_by_title = {}
+    for w in chrome_windows:
+        if not isinstance(w, dict):
+            continue
+        title = w.get("activeTitle")
+        if not isinstance(title, str):
+            continue
+        chrome_counts[title] += 1
+        chrome_by_title[title] = w
+    matches = {}
+    for index, title in hypr_titles:
+        if hypr_counts[title] == 1 and chrome_counts.get(title) == 1:
+            matches[index] = chrome_by_title[title]
+    return matches
+
+
+def chrome_url_suffix(title, window, mode, max_chars):
+    """Text to append to a matched Chrome window's title before it reaches
+    the prompt: the active tab's URL (per chrome_urls) plus, for a
+    multi-tab window, the other tabs' titles. Folded into the title string
+    itself so it flows through the existing prompt-building and
+    signature/cache code unchanged -- a URL or tab-set change then changes
+    the signature exactly like a title change always has."""
+    if mode == "off":
+        return ""
+    tabs = window.get("tabs")
+    tabs = [t for t in tabs if isinstance(t, dict)] if isinstance(tabs, list) else []
+    parts = []
+    active = next((t for t in tabs if t.get("title") == title), None)
+    if active is not None:
+        shown = registrable_domain(active.get("url") or "") if mode == "domain" else (active.get("url") or "")
+        shown = shown[:max_chars]
+        if shown:
+            parts.append(f"[{shown}]")
+    others = [t.get("title", "") for t in tabs if t.get("title") and t.get("title") != title]
+    if others:
+        parts.append("(other tabs: " + ", ".join(o[:max_chars] for o in others[:5]) + ")")
+    return (" " + " ".join(parts)) if parts else ""
+
+
 class Namer:
     def __init__(self):
         self.cfg = {**DEFAULTS, **load_json(CONFIG_PATH, {})}
@@ -334,8 +441,14 @@ class Namer:
         after the filtering every caller needs: special/scratchpad workspaces
         (negative ids) skipped, ignore_classes honoured, titles cleaned and
         clamped. snapshot() and --suggest both build on this so the rules
-        can't drift apart between them."""
+        can't drift apart between them.
+
+        Chrome windows also get a URL suffix folded into their title here
+        (see chrome_url_suffix()), so every caller and the cache signature
+        see it identically -- there's nowhere else this can live without
+        the two drifting apart."""
         ignore = {c.lower() for c in self.cfg["ignore_classes"]}
+        raw = []
         for c in hyprctl("clients"):
             ws = (c.get("workspace") or {}).get("id")
             if not isinstance(ws, int) or ws < 1:
@@ -344,7 +457,33 @@ class Namer:
             if cls.lower() in ignore:
                 continue
             title = clean_title((c.get("title") or "").strip())[: self.cfg["max_title_chars"]]
-            yield ws, cls, title, c.get("address", "")
+            raw.append([ws, cls, title, c.get("address", "")])
+
+        self._enrich_chrome_titles(raw)
+
+        for entry in raw:
+            yield tuple(entry)
+
+    def _enrich_chrome_titles(self, raw):
+        """Mutate raw (list of [ws, cls, title, address]) in place, appending
+        URL info to any Chrome window title that matches one reported by the
+        literate-tabs extension. No-op if chrome_urls is "off" or no fresh
+        report exists -- an unmatched or unreported window is left exactly
+        as it was, today's behaviour."""
+        mode = self.cfg.get("chrome_urls", "domain")
+        if mode not in ("domain", "full"):
+            return
+        chrome_windows = load_chrome_tabs()
+        if not chrome_windows:
+            return
+        hypr_titles = [(i, entry[2]) for i, entry in enumerate(raw)
+                       if entry[1].lower() in CHROME_CLASSES]
+        if not hypr_titles:
+            return
+        for i, window in match_chrome_windows(hypr_titles, chrome_windows).items():
+            suffix = chrome_url_suffix(raw[i][2], window, mode, self.cfg["max_title_chars"])
+            if suffix:
+                raw[i][2] = raw[i][2] + suffix
 
     def snapshot(self):
         """workspace id -> list of (class, title), for real workspaces only."""
