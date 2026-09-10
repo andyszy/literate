@@ -97,3 +97,23 @@ real notification onto a real desktop. Use its `--quiet` flag.
 `omarchy.*` is a reserved namespace and `omarchy plugin validate` rejects it.
 This fork is `literate.bar`. The install directory name must equal the manifest
 id. Run `omarchy plugin validate .` on both `main-*` branches before pushing.
+
+## Sibling: Literate Workspaces
+
+[Literate Workspaces](https://github.com/andyszy/literate-workspaces)
+(`literate.workspaces`) replaces the stock workspace indicators and is meant
+to be installed alongside this bar. It is a **separate plugin on purpose**:
+the shell only registers third-party widgets that sit at the top level of
+`~/.config/omarchy/plugins`, so a widget inside this repo's `widgets/` would
+never be discovered (this vendored `widgets/` directory is dead code when
+the bar runs under the host shell — slots resolve every layout id through
+the host's `barWidgetRegistry`). Consequences for work here:
+
+- The bar needs **no patch** to host it. If the widget stops rendering after
+  a re-vendor, the suspects are `ModuleSlot` / `injectProps` in `Bar.qml`
+  (how a registry component gets `bar`, `moduleName`, `settings`), not the
+  widget.
+- Its IPC target is `literate.workspaces` (`showNumbers` / `hideNumbers`,
+  driven by Hyprland on Super press/release). Don't reuse that id.
+- Widget bugs belong in that repo; read its `CLAUDE.md` before touching it.
+
