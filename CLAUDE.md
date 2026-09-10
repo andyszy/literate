@@ -1,4 +1,4 @@
-# Working on Literate Bar
+# Working on Literate
 
 One Omarchy plugin that supplies three things: a **vendored fork** of Omarchy's
 bar, a **workspace widget** that replaces the stock numbers, and the **daemon**
@@ -113,7 +113,7 @@ reached the log with `quickshell -n -p /usr/share/omarchy/shell log | tail -40`.
 ## The widget
 
 - `moduleName` **must equal the layout id**, which since the merge is the
-  plugin id `literate.bar`. `BarWidget.broadcast()` finds the widget's
+  plugin id `literate`. `BarWidget.broadcast()` finds the widget's
   instances (one per monitor) by matching `slot.moduleName`, so anything
   IPC-driven lands nowhere on a mismatch. (There is no IPC surface today. A
   Super-hold "show numbers" mode driven by bare `SUPER_L` press/release binds

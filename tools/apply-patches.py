@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the Literate Bar patches to a vendored copy of the Omarchy bar.
+"""Apply the Literate patches to a vendored copy of the Omarchy bar.
 
 Idempotent: running it on an already-patched tree is a no-op. Exits non-zero
 if upstream has changed shape enough that a patch no longer applies, so a
@@ -10,8 +10,8 @@ import json
 import sys
 from pathlib import Path
 
-PLUGIN_ID = "literate.bar"
-PLUGIN_NAME = "Literate Bar"
+PLUGIN_ID = "literate"
+PLUGIN_NAME = "Literate"
 
 # manifest.json is re-vendored from upstream on every sync -- it is deliberately
 # not in sync-upstream's --exclude list -- so every field this fork depends on

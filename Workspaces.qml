@@ -14,7 +14,7 @@ import qs.Ui
 // running this degrades to the stock number indicators.
 BarWidget {
   id: root
-  moduleName: "literate.bar"
+  moduleName: "literate"
 
   // "all"     - every named workspace spells its name out (default)
   // "focused" - only the focused workspace does
