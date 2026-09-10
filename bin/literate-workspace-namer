@@ -6,6 +6,7 @@ windows on a workspace actually changes it asks a model for a short name and
 an icon. Results land in a JSON file the bar widget watches.
 
   state:  ~/.local/state/literate/workspaces.json
+  pinned: ~/.local/state/literate/pinned.json
   cache:  ~/.local/state/literate/cache.json
   config: ~/.config/literate/config.json
 
@@ -13,6 +14,8 @@ an icon. Results land in a JSON file the bar widget watches.
   literate-workspace-namer --once          one pass over the live desktop
   literate-workspace-namer --test FIXTURE  name a fixture; print, write nothing
   literate-workspace-namer --suggest ID    one workspace, one model call; print JSON, write nothing
+  literate-workspace-namer --pin ID NAME [ICON]  fix a workspace's name; the model skips it
+  literate-workspace-namer --unpin ID            drop a pin; back to model-named
 """
 
 import json
@@ -41,6 +44,9 @@ CONFIG_PATH = HOME / ".config/literate/config.json"
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 STATE_PATH = STATE_DIR / "workspaces.json"
 CACHE_PATH = STATE_DIR / "cache.json"
+# Kept apart from STATE_PATH because that file is rewritten wholesale every
+# pass -- a pin stored inside it would be gone the next time the model runs.
+PINNED_PATH = STATE_DIR / "pinned.json"
 
 DEFAULTS = {
     # auto | api | claude-cli | local. auto = the API whenever a credential
@@ -275,6 +281,7 @@ class Namer:
             log("WARN: no phosphor-codepoints.json; icons will not be validated")
         self.cache = load_json(CACHE_PATH, {})
         self.state = load_json(STATE_PATH, {})
+        self.pinned = load_json(PINNED_PATH, {})
         self.lock = threading.Lock()
         self.pass_lock = threading.Lock()
         self.timer = None
@@ -464,6 +471,9 @@ class Namer:
             except Exception as e:
                 log("snapshot failed:", e)
                 return
+            # Cheap, and lets `--pin`/`--unpin` from another process take
+            # effect without restarting the daemon.
+            self.pinned = load_json(PINNED_PATH, {})
             self.apply(current, started)
 
     def apply(self, current, started):
@@ -471,7 +481,9 @@ class Namer:
         for ws, windows in current.items():
             sig = self.signature(windows)
             sigs[ws] = sig
-            if sig in self.cache:
+            if ws in self.pinned:
+                resolved[ws] = self.pinned[ws]  # pinned: never asked, never cached
+            elif sig in self.cache:
                 resolved[ws] = self.cache[sig]
             elif self.last_sigs.get(ws) == sig and ws in self.state:
                 resolved[ws] = self.state[ws]  # asked already and it failed; keep
@@ -592,6 +604,33 @@ class Namer:
             "groups": groups,
         }, 0
 
+    # --------------------------------------------------------------------- pin
+
+    def pin(self, ws_arg, name, icon=None):
+        """One-shot, no daemon loop: fix a workspace's name/icon so apply()
+        skips the model for it. Not tied to hyprctl at all -- a pin can be
+        set for a workspace that has no windows (or doesn't exist) yet, so
+        the menu can pin a spot ahead of opening anything in it."""
+        ws = str(ws_arg)
+        if icon is None:
+            # No icon given: keep the one the workspace (or an existing pin
+            # on it) already has, same as clean() falling back on its own.
+            icon = (self.state.get(ws) or self.pinned.get(ws) or {}).get("icon", "")
+        cleaned = self.clean({"name": name, "icon": icon})
+        if not cleaned:
+            return {"error": "name is empty after cleaning"}, 1
+        self.pinned[ws] = cleaned
+        write_atomic(PINNED_PATH, self.pinned)
+        return cleaned, 0
+
+    def unpin(self, ws_arg):
+        ws = str(ws_arg)
+        if ws not in self.pinned:
+            return {"error": f"workspace {ws} is not pinned"}, 1
+        del self.pinned[ws]
+        write_atomic(PINNED_PATH, self.pinned)
+        return {}, 0
+
     # ------------------------------------------------------------------ events
 
     def fast_clear_empty_workspaces(self):
@@ -692,6 +731,32 @@ if __name__ == "__main__":
         except Exception as e:  # a bug here must still exit clean, never a traceback
             payload, code = {"workspace": sys.argv[i + 1], "error": str(e)[:200]}, 1
         print(json.dumps(payload, separators=(",", ":")))
+        sys.exit(code)
+    elif "--pin" in sys.argv:
+        i = sys.argv.index("--pin")
+        rest = sys.argv[i + 1:]
+        if len(rest) < 2:
+            print(json.dumps({"error": "--pin requires a workspace id and a name"}))
+            sys.exit(1)
+        ws_arg, name = rest[0], rest[1]
+        icon = rest[2] if len(rest) > 2 else None
+        result, code = namer.pin(ws_arg, name, icon)
+        if code == 0:
+            print(f'pinned workspace {ws_arg} as "{result["name"]}" ({result["icon"]})')
+        else:
+            print(json.dumps(result))
+        sys.exit(code)
+    elif "--unpin" in sys.argv:
+        i = sys.argv.index("--unpin")
+        if i + 1 >= len(sys.argv):
+            print(json.dumps({"error": "--unpin requires a workspace id"}))
+            sys.exit(1)
+        ws_arg = sys.argv[i + 1]
+        result, code = namer.unpin(ws_arg)
+        if code == 0:
+            print(f"unpinned workspace {ws_arg}")
+        else:
+            print(json.dumps(result))
         sys.exit(code)
     else:
         namer.listen_forever()
