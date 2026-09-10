@@ -6,7 +6,7 @@
 set -euo pipefail
 
 PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="$HOME/.local/share/literate-workspaces/venv"
+VENV="$HOME/.local/share/literate/venv"
 BIN="$HOME/.local/bin/literate-workspace-namer"
 
 if [[ ! -x $VENV/bin/python ]]; then
@@ -15,14 +15,14 @@ if [[ ! -x $VENV/bin/python ]]; then
   "$VENV/bin/pip" install --quiet anthropic
 fi
 
-mkdir -p "$HOME/.local/bin" "$HOME/.config/literate-workspaces"
+mkdir -p "$HOME/.local/bin" "$HOME/.config/literate"
 ln -sfn "$PLUGIN/bin/literate-workspace-namer" "$BIN"
 echo "Linked $BIN"
 
 cat <<SNIPPETS
 
 Now give the daemon a credential -- an API key in
-  ~/.config/literate-workspaces/api-key   (chmod 600)
+  ~/.config/literate/api-key   (chmod 600)
 or ANTHROPIC_API_KEY in the session environment. Without one it falls back
 to the Claude Code CLI, which is slower.
 

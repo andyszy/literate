@@ -157,7 +157,7 @@ reached the log with `quickshell -n -p /usr/share/omarchy/shell log | tail -40`.
   name. Workspaces 6 and 7 in the fixture mirror the few-shot examples, so
   they prove less than the rest.
 - Backends: `auto` → `api` (Anthropic SDK from the venv at
-  `~/.local/share/literate-workspaces/venv`; the daemon adds its
+  `~/.local/share/literate/venv`; the daemon adds its
   `site-packages` to `sys.path` and keeps a plain `python3` shebang so it still
   runs without the venv) → else `claude-cli`. The CLI path only behaves with
   `--system-prompt`, `--tools ""`, an empty `--mcp-config` with
@@ -172,11 +172,14 @@ reached the log with `quickshell -n -p /usr/share/omarchy/shell log | tail -40`.
 - Launch it the way autostart does when testing:
   `hyprctl dispatch 'hl.dsp.exec_cmd("uwsm-app -- literate-workspace-namer")'`.
   `hyprctl dispatch exec …` is not a dispatcher on this Lua-configured Hyprland.
-  Logs go to `~/.local/state/literate-workspaces/daemon.log` (uwsm swallows
+  Logs go to `~/.local/state/literate/daemon.log` (uwsm swallows
   stderr).
-- Its state and config still live under `~/.local/state/literate-workspaces/`
-  and `~/.config/literate-workspaces/`. Those paths predate the merge and were
-  deliberately left alone; they are user data, not repo layout.
+- State, config and the venv live under `~/.local/state/literate/`,
+  `~/.config/literate/` and `~/.local/share/literate/`, set in four constants
+  near the top of the daemon. Change them together, or the widget ends up
+  watching a file nobody writes. The daemon keeps its descriptive name,
+  `literate-workspace-namer`: it is a command, not a namespace, and the
+  Hyprland autostart line refers to it.
 
 ## Privacy
 

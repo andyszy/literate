@@ -10,7 +10,7 @@ import qs.Ui
 // each workspace -- its number, a Phosphor icon and a short name, the last two
 // chosen by a model. The names come from bin/literate-workspace-namer, which
 // watches Hyprland's socket and writes
-// ~/.local/state/literate-workspaces/workspaces.json. When the daemon isn't
+// ~/.local/state/literate/workspaces.json. When the daemon isn't
 // running this degrades to the stock number indicators.
 BarWidget {
   id: root
@@ -38,7 +38,7 @@ BarWidget {
   }
 
   FileView {
-    path: Quickshell.env("HOME") + "/.local/state/literate-workspaces/workspaces.json"
+    path: Quickshell.env("HOME") + "/.local/state/literate/workspaces.json"
     watchChanges: true
     printErrors: false
     onFileChanged: reload()

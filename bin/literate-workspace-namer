@@ -5,9 +5,9 @@ Listens on Hyprland's socket2, debounces the churn, and whenever the set of
 windows on a workspace actually changes it asks a model for a short name and
 an icon. Results land in a JSON file the bar widget watches.
 
-  state:  ~/.local/state/literate-workspaces/workspaces.json
-  cache:  ~/.local/state/literate-workspaces/cache.json
-  config: ~/.config/literate-workspaces/config.json
+  state:  ~/.local/state/literate/workspaces.json
+  cache:  ~/.local/state/literate/cache.json
+  config: ~/.config/literate/config.json
 
   literate-workspace-namer                 run as a daemon
   literate-workspace-namer --once          one pass over the live desktop
@@ -26,8 +26,8 @@ import time
 from pathlib import Path
 
 HOME = Path.home()
-STATE_DIR = HOME / ".local/state/literate-workspaces"
-VENV_DIR = HOME / ".local/share/literate-workspaces/venv"
+STATE_DIR = HOME / ".local/state/literate"
+VENV_DIR = HOME / ".local/share/literate/venv"
 
 # The Anthropic SDK lives in a private venv (Arch ships no python-anthropic and
 # no system pip). Put it on the path rather than pointing the shebang at the
@@ -35,7 +35,7 @@ VENV_DIR = HOME / ".local/share/literate-workspaces/venv"
 # missing.
 for _site in VENV_DIR.glob("lib/python3*/site-packages"):
     sys.path.insert(0, str(_site))
-CONFIG_PATH = HOME / ".config/literate-workspaces/config.json"
+CONFIG_PATH = HOME / ".config/literate/config.json"
 # This script lives in <plugin>/bin/, possibly via a symlink from ~/.local/bin.
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 STATE_PATH = STATE_DIR / "workspaces.json"
@@ -48,7 +48,7 @@ DEFAULTS = {
     "model": "claude-haiku-4-5",
     # A key here (mode 600) is scoped to this daemon; ANTHROPIC_API_KEY in the
     # session environment works too but is visible to every app.
-    "api_key_file": str(HOME / ".config/literate-workspaces/api-key"),
+    "api_key_file": str(HOME / ".config/literate/api-key"),
     # seconds of quiet before we ask; window titles churn a lot while you type
     "debounce": 3.0,
     # ...but never wait longer than this: a terminal whose title carries a
