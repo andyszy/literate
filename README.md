@@ -16,6 +16,22 @@ says and nothing but an edit can change it.
 Dragging individual *widgets* to rearrange them still works — that is a
 separate handler and is untouched.
 
+## Install
+
+```bash
+omarchy plugin add https://github.com/andyszy/literate-bar.git --enable
+```
+
+Then confirm it took:
+
+```bash
+hyprctl layers | grep omarchy-bar     # the layer should be present
+```
+
+Remove it with `omarchy plugin remove literate.bar`. The shell gates the
+active bar on the plugin still being installed, so it falls straight back to
+the built-in bar; `bar.id` stays in `shell.json` as a harmless leftover.
+
 ## Sibling project: Literate Workspaces
 
 [Literate Workspaces](https://github.com/andyszy/literate-workspaces) replaces
@@ -29,21 +45,6 @@ omarchy plugin add https://github.com/andyszy/literate-bar.git --enable
 omarchy plugin add https://github.com/andyszy/literate-workspaces.git --enable
 ```
 
-## Install
-
-```bash
-omarchy plugin add https://github.com/andyszy/literate-bar.git --enable
-```
-
-Then confirm it took:
-
-```bash
-hyprctl layers | grep omarchy-bar     # the layer should be present
-```
-
-Remove it with `omarchy plugin remove literate.bar`, which restores the
-built-in bar.
-
 ## Which branch you want
 
 The Omarchy bar is vendored, not subclassed — QML gives no way to reach into a
@@ -54,9 +55,13 @@ releases.
 
 | Branch | Vendored from | For |
 |---|---|---|
-| `main-mac` (default) | [`omarchy-mac/omarchy-mac`](https://github.com/omarchy-mac/omarchy-mac) | Omarchy on Apple Silicon |
-| `main-basecamp` | [`basecamp/omarchy`](https://github.com/basecamp/omarchy) `v4.0.3` | mainline Omarchy |
+| `main-mac` (default) | [`omarchy-mac/omarchy-mac`](https://github.com/omarchy-mac/omarchy-mac) @ `09f16de` | Omarchy on Apple Silicon |
+| `main-basecamp` | [`basecamp/omarchy`](https://github.com/basecamp/omarchy) @ `v4.0.3` | mainline Omarchy |
 | `upstream-mac`, `upstream-basecamp` | — | pristine vendor bases, no patches |
+
+Both branches are vendored against **Omarchy 4.0.3**. A newer Omarchy still
+works until upstream changes the shell API the bar imports; if the bar
+disappears after an `omarchy update`, that is the signal to re-sync.
 
 `main-mac` is the default branch because `omarchy plugin update` fetches
 `origin HEAD` and merges `--ff-only`; a default branch you are not tracking
@@ -104,8 +109,10 @@ git commit -am "Vendor bar from omarchy-mac <version>"
 git checkout main-mac && git merge upstream-mac
 ```
 
-`tools/sync-upstream` re-vendors every file upstream ships, preserving this
-fork's `README.md` and `tools/`, then re-applies the patches. Repeat for
+`tools/sync-upstream` re-vendors every file upstream ships, preserving the
+files this fork owns (`README.md`, `CLAUDE.md`, `LICENSE`, `tools/`), then
+re-applies the patches. It rsyncs `--delete`, so a new fork-owned file must be
+added to its `--exclude` list or the next sync deletes it. Repeat for
 `upstream-basecamp` / `main-basecamp`.
 
 ## Credit and license
