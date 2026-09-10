@@ -113,7 +113,6 @@ the host's `barWidgetRegistry`). Consequences for work here:
   a re-vendor, the suspects are `ModuleSlot` / `injectProps` in `Bar.qml`
   (how a registry component gets `bar`, `moduleName`, `settings`), not the
   widget.
-- Its IPC target is `literate.workspaces` (`showNumbers` / `hideNumbers`,
-  driven by Hyprland on Super press/release). Don't reuse that id.
+- Its `moduleName` / registry id is `literate.workspaces`. Don't reuse it.
 - Widget bugs belong in that repo; read its `CLAUDE.md` before touching it.
 
