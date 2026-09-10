@@ -85,6 +85,38 @@ next sync silently deletes it.
 Note that upstream's own `widgets/Workspaces.qml` is vendored and unused; ours
 is the root-level one. Do not confuse them.
 
+## `bar.foreground` is the *popup* text colour, not the bar's
+
+Two properties, one letter apart, and upstream aliases them at `Bar.qml:65-69`:
+
+- `barForeground` — what `WidgetButton`/`BarIconButton` paint with, i.e. every
+  glyph and label actually drawn **on** the bar.
+- `foreground` — what everything the bar **spawns** reads: the body text of
+  every panel (audio, network, bluetooth, power, monitor, weather, clock,
+  agents), `Ui/PanelSlider.qml`, and the tray menu. The bar's own chrome never
+  reads it.
+
+Upstream binds both to `Color.bar.text`, which is only safe while the bar and
+its popups share a background. Set `[bar] text` in `~/.config/omarchy/shell.toml`
+— as this machine does, pinning the bar white-on-black to match the notch over
+a light theme — and that white leaks straight onto the light `[popups]` cards:
+every panel renders white text on a white card, or on the light grey of a
+selected row. Only the muted secondary labels stay legible, so it reads as "a
+few widgets are broken" rather than "one colour is wrong".
+
+Patch 4 in `tools/apply-patches.py` re-binds `foreground` to `Color.popups.text`.
+Its one cost: `widgets/Tray.qml:19` reads the same property both for the tray
+menu *and* to colorize **symbolic** tray icons drawn on the bar, so those now
+follow the popup colour. That is upstream conflating two roles in one property;
+patching it here is not an option, because the `omarchy.tray` widget is loaded
+from `/usr/share/omarchy/shell/plugins/bar/widgets/`, never from this repo's
+`widgets/` (see the discovery rules above — this repo's whole `widgets/` tree is
+vendored and dead).
+
+Do not "fix" this by darkening `[popups]` instead. `[controls]` is shared with
+the menu, launcher, polkit and lock surfaces, so making panels dark would drag
+all of those down with it.
+
 ## `active: true` does not mean the bar rendered
 
 `omarchy-shell shell listPlugins` reporting `"active": true` only means the
