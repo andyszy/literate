@@ -7,11 +7,13 @@
   "description": "Omarchy's bar without the misclick gestures, and workspaces named by a model",
   "kinds": [
     "bar",
-    "bar-widget"
+    "bar-widget",
+    "overlay"
   ],
   "entryPoints": {
     "bar": "Bar.qml",
-    "barWidget": "Workspaces.qml"
+    "barWidget": "Workspaces.qml",
+    "overlay": "Overlay.qml"
   },
   "barWidget": {
     "displayName": "Literate Workspaces",
@@ -19,5 +21,6 @@
     "category": "Compositor",
     "allowMultiple": false,
     "defaultSection": "left"
-  }
+  },
+  "keepLoaded": true
 }

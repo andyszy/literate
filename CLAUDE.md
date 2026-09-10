@@ -1,10 +1,11 @@
 # Working on Literate
 
-One Omarchy plugin that supplies three things: a **vendored fork** of Omarchy's
-bar, a **workspace widget** that replaces the stock numbers, and the **daemon**
-that names those workspaces. The manifest declares `kinds: ["bar",
-"bar-widget"]`, so `entryPoints.bar` draws the bar and `entryPoints.barWidget`
-fills the workspace slot.
+One Omarchy plugin that supplies four things: a **vendored fork** of Omarchy's
+bar, a **workspace widget** that replaces the stock numbers, the **daemon**
+that names those workspaces, and a **hold-to-open action menu** for a single
+workspace. The manifest declares `kinds: ["bar", "bar-widget", "overlay"]`, so
+`entryPoints.bar` draws the bar, `entryPoints.barWidget` fills the workspace
+slot, and `entryPoints.overlay` is the menu.
 
 Everything below is a thing that has already gone wrong once.
 
@@ -229,6 +230,43 @@ reached the log with `quickshell -n -p /usr/share/omarchy/shell log | tail -40`.
   watching a file nobody writes. The daemon keeps its descriptive name,
   `literate-workspace-namer`: it is a command, not a namespace, and the
   Hyprland autostart line refers to it.
+
+## The overlay
+
+`Overlay.qml` is the hold-to-open action menu (rename, spin out a group,
+close all) for one workspace. It is a fork-owned file, exactly like
+`Workspaces.qml`: it must stay in `tools/sync-upstream`'s `--exclude` list, or
+the next re-vendor deletes it silently.
+
+- The manifest needs `kinds` to include `"overlay"`,
+  `entryPoints.overlay: "Overlay.qml"`, **and** a top-level `"keepLoaded":
+  true`. All three live in `tools/apply-patches.py`'s `FORK_MANIFEST` dict,
+  same as the bar-widget registration — hand-editing `manifest.json` is
+  useless, it's regenerated from that dict on every sync.
+- `keepLoaded` is not optional. `shell.qml`'s panel `Loader` (the one that
+  covers `panel`/`overlay`/`menu` kinds) is only `active` when the plugin is
+  `keepLoaded` **or** currently summoned — see `computePanelEntries()` and the
+  `panelLoader` in the `Instantiator` delegate. Without `keepLoaded`, the
+  first `summon()` has to activate the Loader and wait on asynchronous QML
+  compilation before `open()` ever runs, so the very first hold feels broken
+  (nothing appears, or appears late). `keepLoaded: true` mounts the overlay at
+  shell startup instead, so every summon after that is instant.
+- Same trap as the bar (see above), same fix: `omarchyPath`, `shell`,
+  `manifest` and `pluginRegistry` are injected by the host **after**
+  construction, in the panel `Loader`'s `onLoaded` handler. Declare all four
+  as plain properties with defaults — `property var shell: null`, not
+  `required property var shell` — or the overlay fails to load at all. This
+  is the exact bug that once took down the whole bar on this machine; it is
+  just as fatal on an overlay, it just fails more quietly (no bar disappears,
+  the menu just never opens, and the failure is a Loader.Error console
+  warning rather than a black screen).
+- Lifecycle contract is `open(payloadJson)` / `close()` / `ping()`, copied
+  from `/usr/share/omarchy/shell/plugins/menu/Menu.qml` and
+  `plugins/clipboard/Clipboard.qml`. `open()` gets `{"workspace":"N"}` and
+  must render something before the `--suggest` model call returns — show the
+  header and static rows immediately, replace a real animated progress bar
+  (not a "Thinking…" row) with the suggested name once the call lands or
+  fails or hits its ~10s timeout.
 
 ## Privacy
 
