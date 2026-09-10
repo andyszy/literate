@@ -21,7 +21,7 @@ omarchy plugin add https://github.com/andyszy/literate.git --enable
 nothing behind your back.
 
 Then give the daemon a credential: an API key in
-`~/.config/literate-workspaces/api-key` (chmod 600, scoped to this daemon),
+`~/.config/literate/api-key` (chmod 600, scoped to this daemon),
 `ANTHROPIC_API_KEY` in the session environment, or `ant auth login`.
 
 Confirm the bar took:
@@ -62,7 +62,7 @@ the tool, and for any workspace whose window set changed asks the model for a
 name and an icon — feeding it the previous name so it doesn't flap between
 "email" and "q3 invoice" on every tab switch. Identical window sets are cached
 and never asked twice. Results are written atomically to
-`~/.local/state/literate-workspaces/workspaces.json`, which the widget watches.
+`~/.local/state/literate/workspaces.json`, which the widget watches.
 
 The widget shows number + icon + name for every workspace, the focused one
 bright, empty ones as just their number.
@@ -76,9 +76,9 @@ bright, empty ones as just their number.
 | Daemon | `bin/literate-workspace-namer` (linked to `~/.local/bin`) |
 | Phosphor font + name→codepoint map | `fonts/Phosphor.ttf`, `phosphor-codepoints.json` (1530 icons) |
 | Prompt eval fixture | `fixtures/eval.json` |
-| Daemon config (optional) | `~/.config/literate-workspaces/config.json` |
-| State, cache, log | `~/.local/state/literate-workspaces/` |
-| SDK venv | `~/.local/share/literate-workspaces/venv` |
+| Daemon config (optional) | `~/.config/literate/config.json` |
+| State, cache, log | `~/.local/state/literate/` |
+| SDK venv | `~/.local/share/literate/venv` |
 
 ## Tuning
 
@@ -94,13 +94,13 @@ It looks odd and is correct; `omarchy.menu` does the same thing.
 - `gap`: space between workspaces (and before the first), in em
 - `accentFocused`: paint the focused workspace in the bar's active colour
 
-Daemon settings, `~/.config/literate-workspaces/config.json` (all optional):
+Daemon settings, `~/.config/literate/config.json` (all optional):
 
 ```json
 {
   "backend": "auto",
   "model": "claude-haiku-4-5",
-  "api_key_file": "~/.config/literate-workspaces/api-key",
+  "api_key_file": "~/.config/literate/api-key",
   "debounce": 3.0,
   "max_name_chars": 18,
   "ignore_classes": ["1password"]
@@ -118,7 +118,7 @@ machine).
 ```bash
 literate-workspace-namer --test ~/.config/omarchy/plugins/literate/fixtures/eval.json
 literate-workspace-namer --once      # one pass over the live desktop
-tail -f ~/.local/state/literate-workspaces/daemon.log
+tail -f ~/.local/state/literate/daemon.log
 ```
 
 ## Privacy
