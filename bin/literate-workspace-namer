@@ -230,6 +230,10 @@ class Namer:
         self.timer = None
         self.first_event = None
         self.last_sigs = {}
+        # monotonic time of the last fast-clear per workspace, so a slow
+        # in-flight pass that started before the clear can tell its answer
+        # is stale and drop it instead of resurrecting the workspace.
+        self.cleared_at = {}
 
     # ---------------------------------------------------------------- snapshot
 
@@ -390,15 +394,16 @@ class Namer:
     # -------------------------------------------------------------------- pass
 
     def run_pass(self):
+        started = time.monotonic()  # see the cleared_at check in apply()
         with self.pass_lock:
             try:
                 current = self.snapshot()
             except Exception as e:
                 log("snapshot failed:", e)
                 return
-            self.apply(current)
+            self.apply(current, started)
 
-    def apply(self, current):
+    def apply(self, current, started):
         pending, resolved, sigs = {}, {}, {}
         for ws, windows in current.items():
             sig = self.signature(windows)
@@ -424,6 +429,14 @@ class Namer:
                 for ws in pending:
                     if ws in self.state:
                         resolved[ws] = self.state[ws]
+
+        # fast_clear_empty_workspaces() can land while name_workspaces() above
+        # was waiting on the model. If a workspace this pass started with went
+        # empty since, its answer here is stale -- drop it rather than
+        # resurrecting a workspace that has already been correctly cleared.
+        for ws in list(resolved):
+            if self.cleared_at.get(ws, 0) > started:
+                del resolved[ws]
 
         self.last_sigs = sigs
         if resolved != self.state:
@@ -458,6 +471,30 @@ class Namer:
                   + " | ".join(f"[{c}] {t}" for c, t in pending[ws]))
 
     # ------------------------------------------------------------------ events
+
+    def fast_clear_empty_workspaces(self):
+        """closewindow carries only the window's address, not its workspace,
+        so there is no way to know which workspace to check without asking
+        Hyprland -- but that ask needs no model call, just a diff against
+        what we last knew had windows, so there is nothing to gain from
+        waiting on the debounce for it. Wiping a workspace's entry the
+        instant it goes to zero windows is what makes the bar clear
+        immediately instead of lagging by a whole debounce window."""
+        try:
+            current = self.snapshot()
+        except Exception as e:
+            log("fast-clear snapshot failed:", e)
+            return
+        emptied = [ws for ws in self.state if ws not in current]
+        if not emptied:
+            return
+        now = time.monotonic()
+        for ws in emptied:
+            self.cleared_at[ws] = now  # lets apply() reject a late, stale answer
+        self.state = {ws: v for ws, v in self.state.items() if ws not in emptied}
+        self.last_sigs = {ws: v for ws, v in self.last_sigs.items() if ws not in emptied}
+        write_atomic(STATE_PATH, self.state)
+        log("cleared", ",".join(sorted(emptied, key=int)), "(emptied)")
 
     def schedule(self):
         """Debounce, with a ceiling: a stream of events still yields a pass
@@ -511,6 +548,8 @@ class Namer:
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 event = line.decode("utf-8", "replace").split(">>", 1)[0]
+                if event == "closewindow":
+                    self.fast_clear_empty_workspaces()
                 if event in watched:
                     self.schedule()
 
