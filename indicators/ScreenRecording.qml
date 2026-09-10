@@ -15,7 +15,7 @@ BarIndicator {
 
   function refresh() {
     if (!root.bar || statusProc.running) return
-    statusProc.command = ["omarchy-capture-screenrecording-process"]
+    statusProc.command = ["pgrep", "--quiet", "-f", "^gpu-screen-recorder"]
     statusProc.running = true
   }
 
