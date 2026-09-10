@@ -237,7 +237,12 @@ Item {
     if (addrs.length > 0) {
       var dispatches = []
       for (var j = 0; j < addrs.length; j++)
-        dispatches.push("dispatch movetoworkspacesilent " + target + ",address:" + addrs[j])
+        // This Hyprland is Lua-configured: `hyprctl dispatch` is shorthand for
+        // hl.dispatch(...), so the classic "movetoworkspacesilent 4,address:0x.."
+        // string form is a Lua syntax error, not a dispatch. It fails on stderr
+        // and looks exactly like nothing happening.
+        dispatches.push('dispatch hl.dsp.window.move({ workspace = "' + target
+          + '", follow = false, window = "address:' + addrs[j] + '" })')
       spinOutProc.command = ["hyprctl", "--batch", dispatches.join(" ; ")]
       spinOutProc.running = true
     }
@@ -249,7 +254,9 @@ Item {
     if (addrs.length > 0) {
       var dispatches = []
       for (var i = 0; i < addrs.length; i++)
-        dispatches.push("dispatch closewindow address:" + addrs[i])
+        // Lua dispatcher form, as above.
+        dispatches.push('dispatch hl.dsp.window.close({ window = "address:'
+          + addrs[i] + '" })')
       closeAllProc.command = ["hyprctl", "--batch", dispatches.join(" ; ")]
       closeAllProc.running = true
     }
@@ -389,8 +396,24 @@ Item {
   // Fire-and-forget action processes. The overlay closes the instant one of
   // these starts; none of them need their result observed here.
   Process { id: renameProc }
-  Process { id: spinOutProc }
-  Process { id: closeAllProc }
+  Process {
+    id: spinOutProc
+    // A bad dispatch prints to stderr and exits 0, so without this the whole
+    // action is a no-op with no trace anywhere.
+    stderr: SplitParser {
+      onRead: function(line) {
+        if (String(line || "").trim()) console.warn("literate spin-out:", line)
+      }
+    }
+  }
+  Process {
+    id: closeAllProc
+    stderr: SplitParser {
+      onRead: function(line) {
+        if (String(line || "").trim()) console.warn("literate close-all:", line)
+      }
+    }
+  }
 
   PanelWindow {
     id: panel
