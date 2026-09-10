@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "literate.bar",
-  "name": "Literate Bar",
+  "id": "literate",
+  "name": "Literate",
   "version": "1.0.0",
   "author": "andyszy",
   "description": "Omarchy's bar without the misclick gestures, and workspaces named by a model",

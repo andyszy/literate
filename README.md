@@ -1,4 +1,4 @@
-# Literate Bar
+# Literate
 
 Omarchy's status bar, with two changes: the empty-bar click gestures are gone,
 and the workspaces say what you are doing on them.
@@ -12,8 +12,8 @@ one declares `bar` and `bar-widget`, so `Bar.qml` draws the bar and
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/andyszy/literate-bar.git --enable
-~/.config/omarchy/plugins/literate.bar/tools/install
+omarchy plugin add https://github.com/andyszy/literate.git --enable
+~/.config/omarchy/plugins/literate/tools/install
 ```
 
 `tools/install` creates a venv with the Anthropic SDK, links the daemon into
@@ -31,8 +31,8 @@ hyprctl layers | grep omarchy-bar     # the layer should be present
 hyprctl monitors | grep reserved      # e.g. "reserved: 0 32 0 0" for a top bar
 ```
 
-Update with `omarchy plugin update literate.bar`. Remove with
-`omarchy plugin remove literate.bar`. The shell gates the active bar on the
+Update with `omarchy plugin update literate`. Remove with
+`omarchy plugin remove literate`. The shell gates the active bar on the
 plugin still being installed, so removal falls straight back to the built-in
 bar; `bar.id` stays in `shell.json` as a harmless leftover.
 
@@ -82,12 +82,12 @@ bright, empty ones as just their number.
 
 ## Tuning
 
-Widget settings go on the `literate.bar` entry in `bar.layout`. That is the
+Widget settings go on the `literate` entry in `bar.layout`. That is the
 same id that `bar.id` uses to select the bar — one plugin, one id, two roles.
 It looks odd and is correct; `omarchy.menu` does the same thing.
 
 ```json
-{ "id": "literate.bar", "showNames": "all", "gap": 1.0, "accentFocused": false }
+{ "id": "literate", "showNames": "all", "gap": 1.0, "accentFocused": false }
 ```
 
 - `showNames`: `all` (default) / `focused` / `never`
@@ -116,7 +116,7 @@ machine).
 ## Testing the prompt
 
 ```bash
-literate-workspace-namer --test ~/.config/omarchy/plugins/literate.bar/fixtures/eval.json
+literate-workspace-namer --test ~/.config/omarchy/plugins/literate/fixtures/eval.json
 literate-workspace-namer --once      # one pass over the live desktop
 tail -f ~/.local/state/literate-workspaces/daemon.log
 ```
@@ -152,9 +152,9 @@ makes every update fail to fast-forward.
 On mainline Omarchy, install the other branch by hand:
 
 ```bash
-git clone -b main-basecamp https://github.com/andyszy/literate-bar.git \
-  ~/.config/omarchy/plugins/literate.bar
-omarchy plugin enable literate.bar
+git clone -b main-basecamp https://github.com/andyszy/literate.git \
+  ~/.config/omarchy/plugins/literate
+omarchy plugin enable literate
 ```
 
 The workspace widget is identical on every branch; only the vendored bar
@@ -167,8 +167,8 @@ upstream instead of rebased through conflicts. `tools/apply-patches.py` is
 idempotent and exits non-zero if a patch site has changed shape, so a bad
 re-sync fails loudly instead of shipping a half-patched bar.
 
-1. **Rename the plugin** — `manifest.json` becomes `literate.bar` /
-   "Literate Bar". The `omarchy.*` id namespace is reserved.
+1. **Rename the plugin** — `manifest.json` becomes `literate` /
+   "Literate". The `omarchy.*` id namespace is reserved.
 2. **Un-require the host-injected properties** *(mac branch only)* —
    `shell.qml` loads a non-default bar with `Loader { source: url }` and only
    then assigns `omarchyPath`, `barWidgetRegistry` and `barConfig`, in
