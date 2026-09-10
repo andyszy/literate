@@ -181,6 +181,12 @@ re-sync fails loudly instead of shipping a half-patched bar.
    atomic"*); the `omarchy-mac` fork regressed them, so only that branch needs
    this.
 3. **Remove `CenterGestureArea`** — the actual point of the fork.
+4. **Re-bind `bar.foreground` to `Color.popups.text`** — that property is read
+   only by surfaces the bar *spawns* (every panel's body text, the tray menu),
+   never by the bar's own chrome, which uses `barForeground`. Upstream aliases
+   the two, which holds only while the bar and its popups share a background;
+   a bar pinned to black over a light theme then paints white text on white
+   popup cards.
 
 ## Re-syncing after an Omarchy release
 
