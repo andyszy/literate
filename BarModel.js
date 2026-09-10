@@ -208,9 +208,66 @@ function nearestDropTarget(candidates, point, vertical) {
   return best
 }
 
+// Camera-cutout depths measured on real hardware, keyed by physical panel
+// size. Apple's notched panels expose more rows above the 16:10 area than
+// the cutout actually covers (Apple's own menu bar extends below the notch
+// too), so a measured panel gets its exact cutout and an unmeasured panel
+// keeps the full strip — which errs taller, never shorter.
+var measuredNotchPanels = [
+  // MacBook Pro 14" (3024x1964): 64 of the 74 rows above the 16:10 area.
+  { width: 3024, height: 1964, cutoutRows: 64 },
+  // MacBook Pro 16" (3456x2234): inferred from the 14" — same 254ppi panel
+  // family and camera module, so the cutout spans the same 64 rows.
+  { width: 3456, height: 2234, cutoutRows: 64 },
+  // MacBook Air 13.6" and 15" (224ppi): the cutout is physically the same
+  // size as the Pros', so it spans fewer rows there (64 x 224/254 ~= 56).
+  { width: 2560, height: 1664, cutoutRows: 56 },
+  { width: 2880, height: 1864, cutoutRows: 56 }
+]
+
+function measuredCutoutRows(physicalWidth, physicalHeight) {
+  for (var i = 0; i < measuredNotchPanels.length; i++) {
+    var panel = measuredNotchPanels[i]
+    // Logical sizes are rounded, so the reconstructed physical size can be
+    // a couple of pixels off at fractional scales.
+    if (Math.abs(physicalWidth - panel.width) <= 4 && Math.abs(physicalHeight - panel.height) <= 4)
+      return panel.cutoutRows
+  }
+  return 0
+}
+
+// Apple's notched laptop panels are a 16:10 display plus a camera strip above
+// it, so whatever extends beyond the 16:10 area is the notch strip. Hyprland
+// applies the display scale to both axes, so the scale cancels out and the
+// strip height falls straight out of the logical screen size.
+//
+// Callers gate on the machine being Apple Silicon; this only guards against
+// panels the formula does not describe: external monitors (not eDP), 16:10
+// or wider panels (no leftover), and taller aspect ratios (rotated or 3:2
+// panels), where the leftover is far more than a camera strip. Every notched
+// Apple panel's strip is ~3.8% of its height, so 5% is a comfortable bound.
+function notchHeight(screenName, logicalWidth, logicalHeight, devicePixelRatio) {
+  if (String(screenName || "").indexOf("eDP") !== 0) return 0
+
+  var width = Number(logicalWidth)
+  var height = Number(logicalHeight)
+  if (!(width > 0) || !(height > 0)) return 0
+
+  var strip = height - (width * 10) / 16
+  if (strip <= 0 || strip > height / 20) return 0
+
+  var scale = Number(devicePixelRatio)
+  if (scale > 0) {
+    var cutout = measuredCutoutRows(Math.round(width * scale), Math.round(height * scale))
+    if (cutout > 0) return Math.ceil(cutout / scale)
+  }
+  return Math.ceil(strip)
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     isDrawnSlot: isDrawnSlot,
+    notchHeight: notchHeight,
     pickDrawnSlot: pickDrawnSlot,
     pickPanelSlot: pickPanelSlot,
     nearestDropTarget: nearestDropTarget,
