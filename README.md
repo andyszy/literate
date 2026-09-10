@@ -16,6 +16,19 @@ says and nothing but an edit can change it.
 Dragging individual *widgets* to rearrange them still works — that is a
 separate handler and is untouched.
 
+## Sibling project: Literate Workspaces
+
+[Literate Workspaces](https://github.com/andyszy/literate-workspaces) replaces
+the numbered workspace indicators with a Phosphor icon and a short name per
+workspace, chosen by a model from the windows open there; hold Super and the
+icons turn back into numbers. It is a separate plugin so each project tracks
+its own upstream, but the two are meant to be used together:
+
+```bash
+omarchy plugin add https://github.com/andyszy/literate-bar.git --enable
+omarchy plugin add https://github.com/andyszy/literate-workspaces.git --enable
+```
+
 ## Install
 
 ```bash
