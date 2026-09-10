@@ -657,6 +657,7 @@ class Namer:
             return {"error": "name is empty after cleaning"}, 1
         self.pinned[ws] = cleaned
         write_atomic(PINNED_PATH, self.pinned)
+        self.show_pin_now(ws, cleaned)
         return cleaned, 0
 
     def unpin(self, ws_arg):
@@ -665,7 +666,34 @@ class Namer:
             return {"error": f"workspace {ws} is not pinned"}, 1
         del self.pinned[ws]
         write_atomic(PINNED_PATH, self.pinned)
+        self.show_pin_now(ws, None)
         return {}, 0
+
+    @staticmethod
+    def show_pin_now(ws, entry):
+        """Push a pin straight onto the bar instead of waiting for a pass.
+
+        pinned.json is what apply() consults, but workspaces.json is what the
+        widget renders, and a pass only runs on a Hyprland event plus the
+        debounce. Writing only the pin means a rename from the menu appears to
+        do nothing on a quiet desktop -- the name is correct on disk and
+        invisible for minutes. Write both.
+
+        This races the daemon, which owns workspaces.json, but only benignly:
+        a pass already in flight re-reads pinned.json before it decides, so
+        the worst case is one stale render that the next pass corrects.
+        """
+        state = load_json(STATE_PATH, {})
+        if entry is None:
+            # Drop the old pinned label rather than leave it showing; the next
+            # pass names the workspace again if it still has windows.
+            if state.pop(ws, None) is None:
+                return
+        else:
+            if state.get(ws) == entry:
+                return
+            state[ws] = entry
+        write_atomic(STATE_PATH, state)
 
     # ------------------------------------------------------------------ events
 
