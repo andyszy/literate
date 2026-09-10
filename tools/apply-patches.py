@@ -13,12 +13,31 @@ from pathlib import Path
 PLUGIN_ID = "literate.bar"
 PLUGIN_NAME = "Literate Bar"
 
+# manifest.json is re-vendored from upstream on every sync -- it is deliberately
+# not in sync-upstream's --exclude list -- so every field this fork depends on
+# has to be re-stated here. Anything merely edited by hand in the checkout is
+# gone after the next sync. In particular the bar-widget registration lives
+# here: drop it and the workspace widget silently stops being discovered.
+FORK_MANIFEST = {
+    "id": PLUGIN_ID,
+    "name": PLUGIN_NAME,
+    "author": "andyszy",
+    "description": "Omarchy's bar without the misclick gestures, and workspaces named by a model",
+    "kinds": ["bar", "bar-widget"],
+    "entryPoints": {"bar": "Bar.qml", "barWidget": "Workspaces.qml"},
+    "barWidget": {
+        "displayName": "Literate Workspaces",
+        "description": "Workspaces named by a model, with a Phosphor icon each",
+        "category": "Compositor",
+        "allowMultiple": False,
+        "defaultSection": "left",
+    },
+}
+
 
 def patch_manifest(path: Path) -> None:
     manifest = json.loads(path.read_text())
-    manifest["id"] = PLUGIN_ID
-    manifest["name"] = PLUGIN_NAME
-    manifest["description"] = "The Omarchy bar with the empty-bar click gestures removed"
+    manifest.update(FORK_MANIFEST)
     path.write_text(json.dumps(manifest, indent=2) + "\n")
 
 

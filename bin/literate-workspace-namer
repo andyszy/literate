@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""Name Hyprland workspaces with an LLM, and pick a Phosphor icon for each.
+
+Listens on Hyprland's socket2, debounces the churn, and whenever the set of
+windows on a workspace actually changes it asks a model for a short name and
+an icon. Results land in a JSON file the bar widget watches.
+
+  state:  ~/.local/state/literate-workspaces/workspaces.json
+  cache:  ~/.local/state/literate-workspaces/cache.json
+  config: ~/.config/literate-workspaces/config.json
+
+  literate-workspace-namer                 run as a daemon
+  literate-workspace-namer --once          one pass over the live desktop
+  literate-workspace-namer --test FIXTURE  name a fixture; print, write nothing
+"""
+
+import json
+import os
+import re
+import unicodedata
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE_DIR = HOME / ".local/state/literate-workspaces"
+VENV_DIR = HOME / ".local/share/literate-workspaces/venv"
+
+# The Anthropic SDK lives in a private venv (Arch ships no python-anthropic and
+# no system pip). Put it on the path rather than pointing the shebang at the
+# venv, so the daemon still starts -- on the CLI backend -- when the venv is
+# missing.
+for _site in VENV_DIR.glob("lib/python3*/site-packages"):
+    sys.path.insert(0, str(_site))
+CONFIG_PATH = HOME / ".config/literate-workspaces/config.json"
+# This script lives in <plugin>/bin/, possibly via a symlink from ~/.local/bin.
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+STATE_PATH = STATE_DIR / "workspaces.json"
+CACHE_PATH = STATE_DIR / "cache.json"
+
+DEFAULTS = {
+    # auto | api | claude-cli | local. auto = the API whenever a credential
+    # can be found, else the Claude Code CLI (slower, but rides its login).
+    "backend": "auto",
+    "model": "claude-haiku-4-5",
+    # A key here (mode 600) is scoped to this daemon; ANTHROPIC_API_KEY in the
+    # session environment works too but is visible to every app.
+    "api_key_file": str(HOME / ".config/literate-workspaces/api-key"),
+    # seconds of quiet before we ask; window titles churn a lot while you type
+    "debounce": 3.0,
+    # ...but never wait longer than this: a terminal whose title carries a
+    # spinner (Claude Code's does) emits a title event every second forever.
+    "max_wait": 10.0,
+    "max_title_chars": 120,
+    "max_name_chars": 18,
+    # window classes left out of what the model sees
+    "ignore_classes": [],
+    # backend=local: any OpenAI-compatible /v1/chat/completions endpoint
+    "local_url": "http://127.0.0.1:8080/v1/chat/completions",
+    "local_model": "local",
+    "request_timeout": 120,
+}
+
+# Almost every GUI app appends its own name to the title. Left in, the model
+# sees the tool three times (class, suffix, and often the page chrome) and one
+# quiet mention of what you're actually looking at -- so it names the tool.
+RE_APP_SUFFIX = re.compile(
+    r"\s*[-–—|·]\s*"
+    r"(google chrome|chromium|mozilla firefox|firefox|brave|microsoft edge|safari"
+    r"|visual studio code|vscodium|code ?- ?oss|neovim|nvim|vim|emacs"
+    r"|slack|discord|telegram|signal|thunderbird|obsidian|zed|sublime text"
+    r"|libreoffice (writer|calc|impress)|gimp|inkscape|blender|spotify|vlc|mpv)"
+    r"\s*$", re.I)
+
+RE_JSON = re.compile(r"\{.*\}", re.S)
+
+# A vocabulary hint, not a whitelist: any of the 1530 Phosphor names validates.
+ICON_HINTS = """envelope chat-circle chats-circle phone video-camera calendar clock timer
+code terminal-window git-branch git-pull-request bug wrench gear package cube stack database
+tree-structure file-text files folder note-pencil list-checks kanban book-open graduation-cap
+globe magnifying-glass link bookmark newspaper article rss
+chart-line presentation-chart table receipt currency-dollar bank briefcase shopping-cart
+palette pen-nib image film-slate music-note headphones microphone waveform game-controller
+airplane map-pin house bed suitcase-rolling coffee fork-knife pizza heart star
+users user-circle identification-card lock key shield-check
+monitor devices hard-drives download upload cloud rocket-launch flask lightbulb sliders
+sun moon leaf dog paw-print app-window"""
+
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "workspaces": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "icon": {"type": "string"},
+                },
+                "required": ["id", "name", "icon"],
+            },
+        }
+    },
+    "required": ["workspaces"],
+}
+
+
+LOG_PATH = STATE_DIR / "daemon.log"
+
+
+def log(*a):
+    line = " ".join([time.strftime("[%H:%M:%S]"), *map(str, a)])
+    print(line, file=sys.stderr, flush=True)
+    try:  # uwsm swallows stderr; keep a copy where `tail -f` can find it
+        with LOG_PATH.open("a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def load_json(path, fallback):
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return fallback
+
+
+def write_atomic(path, payload):
+    """FileView is watching this path; never let it see a half-written file."""
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    tmp.replace(path)
+
+
+def hyprctl(*args):
+    # hyprctl can hang while the compositor is busy (a shell restart, say); a
+    # bounded wait turns that into one skipped pass instead of a wedged daemon.
+    out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True, timeout=15)
+    if out.returncode != 0:
+        raise RuntimeError(f"hyprctl {args}: {out.stderr.strip()}")
+    return json.loads(out.stdout)
+
+
+def strip_status_glyphs(title):
+    """Drop leading symbol characters: the spinners and status marks agent
+    terminals put in front of their titles (Claude Code cycles through
+    a whole set while it works) so the title, and with it a workspace's
+    signature, stops changing every second."""
+    i = 0
+    while i < len(title) and (title[i].isspace() or unicodedata.category(title[i]) in ("So", "Sm", "Sk", "Cn")):
+        i += 1
+    return title[i:]
+
+
+def clean_title(title):
+    title = strip_status_glyphs(title)
+    prev = None
+    while title != prev:
+        prev = title
+        title = RE_APP_SUFFIX.sub("", title).strip()
+    return title
+
+
+# ------------------------------------------------------------------ prompting
+
+def system_prompt(max_name_chars):
+    return f"""You label workspaces on a Linux tiling desktop. Each workspace is a list of its open windows, written as [window class] window title. Say what the person is doing on each workspace in a very short name, and pick one Phosphor icon for it.
+
+The class tells you which tool is open. The title tells you what it is being used for. Always name the subject, never the tool: "email", not "browser"; "flight to lisbon", not "chrome"; "auth refactor", not "neovim".
+
+Rules
+- One window: name what that window is about. A workspace holding only Gmail is "email". Only Spotify is "music". Only a terminal at ~/src/foo is "foo".
+- Several windows on one topic: name the topic.
+- Several unrelated windows: name the one the person is most likely working in. Fall back to "browsing" only for a true grab-bag of unrelated pages.
+- Terminal titles from AI coding tools (Claude Code and the like) describe the task in progress; name that task.
+- If a workspace has a "previous" name and the windows still fit it, keep it. Do not rename a workspace just because someone opened a different email or switched tab within the same activity.
+- Names: 1-3 words, lowercase, at most {max_name_chars} characters, no trailing punctuation, no quotes. Every workspace gets a different name.
+- Icon: the Phosphor icon name that best fits the subject, such as {" ".join(ICON_HINTS.split())}. Any Phosphor icon is allowed. Plain names only, no -fill or -bold variants.
+
+Examples
+
+Workspace 1:
+  - [google-chrome] Inbox (1,432) - andy@gmail.com - Gmail
+Workspace 2:
+  - [google-chrome] Flights from LIS to LHR | Google Flights
+  - [google-chrome] Lisbon hotels - Booking.com
+Workspace 3:
+  - [foot] nvim ~/src/billing/invoice.rb
+  - [foot] andy@mac:~/src/billing
+Workspace 4:
+  - [Slack] #eng-platform - Acme
+  - [google-chrome] RFC: auth token rotation - Google Docs
+Workspace 5 (previous: "email"):
+  - [google-chrome] Re: Q3 invoice - andy@gmail.com - Gmail
+
+{{"workspaces": [
+  {{"id": "1", "name": "email", "icon": "envelope"}},
+  {{"id": "2", "name": "lisbon trip", "icon": "airplane"}},
+  {{"id": "3", "name": "billing", "icon": "receipt"}},
+  {{"id": "4", "name": "auth token rfc", "icon": "key"}},
+  {{"id": "5", "name": "email", "icon": "envelope"}}
+]}}"""
+
+
+def user_prompt(pending, previous):
+    lines = []
+    for ws, windows in sorted(pending.items(), key=lambda kv: int(kv[0])):
+        prev = previous.get(ws)
+        head = f"Workspace {ws}" + (f' (previous: "{prev}")' if prev else "") + ":"
+        lines.append(head)
+        for cls, title in windows:
+            lines.append(f"  - [{cls}] {title}" if title else f"  - [{cls}]")
+    return "\n".join(lines) + "\n\nReply with the JSON object only."
+
+
+class Namer:
+    def __init__(self):
+        self.cfg = {**DEFAULTS, **load_json(CONFIG_PATH, {})}
+        self.icons = load_json(PLUGIN_DIR / "phosphor-codepoints.json", {})
+        if not self.icons:
+            log("WARN: no phosphor-codepoints.json; icons will not be validated")
+        self.cache = load_json(CACHE_PATH, {})
+        self.state = load_json(STATE_PATH, {})
+        self.lock = threading.Lock()
+        self.pass_lock = threading.Lock()
+        self.timer = None
+        self.first_event = None
+        self.last_sigs = {}
+
+    # ---------------------------------------------------------------- snapshot
+
+    def snapshot(self):
+        """workspace id -> list of (class, title), for real workspaces only."""
+        by_ws = {}
+        ignore = {c.lower() for c in self.cfg["ignore_classes"]}
+        for c in hyprctl("clients"):
+            ws = (c.get("workspace") or {}).get("id")
+            if not isinstance(ws, int) or ws < 1:
+                continue  # special/scratchpad workspaces have negative ids
+            cls = (c.get("initialClass") or c.get("class") or "").strip()
+            if cls.lower() in ignore:
+                continue
+            title = clean_title((c.get("title") or "").strip())[: self.cfg["max_title_chars"]]
+            by_ws.setdefault(str(ws), []).append((cls, title))
+        for wins in by_ws.values():
+            wins.sort()
+        return by_ws
+
+    @staticmethod
+    def signature(windows):
+        return json.dumps(windows, sort_keys=True)
+
+    # ------------------------------------------------------------------- model
+
+    def read_key_file(self):
+        try:
+            return Path(self.cfg["api_key_file"]).expanduser().read_text().strip()
+        except OSError:
+            return ""
+
+    def api_available(self):
+        try:
+            import anthropic  # noqa: F401
+        except ImportError:
+            return False
+        return bool(self.read_key_file()
+                    or os.environ.get("ANTHROPIC_API_KEY")
+                    or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+                    or (HOME / ".config/anthropic").exists())  # `ant auth login` profile
+
+    def backend(self):
+        chosen = self.cfg["backend"]
+        if chosen == "auto":
+            chosen = "api" if self.api_available() else "claude-cli"
+        if chosen != getattr(self, "_announced_backend", None):
+            self._announced_backend = chosen
+            log(f"backend: {chosen} ({self.cfg['model'] if chosen != 'local' else self.cfg['local_model']})")
+        return chosen
+
+    def ask(self, system, user):
+        backend = self.backend()
+        if backend == "claude-cli":
+            return self._ask_claude_cli(system, user)
+        if backend == "api":
+            return self._ask_api(system, user)
+        if backend == "local":
+            return self._ask_local(system, user)
+        raise RuntimeError(f"unknown backend: {backend}")
+
+    def _ask_claude_cli(self, system, user):
+        # Strip the coding-agent harness: no tools, no MCP servers, and not
+        # Claude Code's own system prompt (which pulls every answer towards
+        # "coding"). Extended thinking is on by default in the CLI and turns a
+        # 4-second answer into a 90-second one -- off. (--bare would be nice
+        # too, but it skips the keychain read that holds the login.)
+        r = subprocess.run(
+            ["claude", "-p", user, "--model", self.cfg["model"],
+             "--tools", "", "--no-session-persistence",
+             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+             "--system-prompt", system,
+             "--output-format", "json"],
+            env={**os.environ, "MAX_THINKING_TOKENS": "0"},
+            capture_output=True, text=True, timeout=self.cfg["request_timeout"],
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"claude cli: {r.stderr.strip()[:300]}")
+        try:
+            envelope = json.loads(r.stdout)
+        except ValueError:
+            return r.stdout
+        if isinstance(envelope, dict):
+            if envelope.get("is_error"):  # the CLI still exits 0 on these
+                raise RuntimeError(f"claude cli: {envelope.get('result', '')!s:.300}")
+            if isinstance(envelope.get("structured_output"), dict):
+                return json.dumps(envelope["structured_output"])
+            if "result" in envelope:
+                return str(envelope["result"])
+        return r.stdout
+
+    def _ask_api(self, system, user):
+        import anthropic
+        if not hasattr(self, "_client"):
+            key = self.read_key_file()
+            # No key file: the SDK resolves ANTHROPIC_API_KEY / an `ant auth
+            # login` profile on its own.
+            self._client = anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
+        try:
+            response = self._client.with_options(timeout=self.cfg["request_timeout"]).messages.create(
+                model=self.cfg["model"],
+                max_tokens=1024,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+        except anthropic.AuthenticationError as e:
+            raise RuntimeError(
+                f"API auth failed ({e.message}); put a key in {self.cfg['api_key_file']} "
+                f"or export ANTHROPIC_API_KEY") from e
+        except anthropic.APIStatusError as e:
+            raise RuntimeError(f"API error {e.status_code}: {e.message}") from e
+        except anthropic.APIConnectionError as e:
+            raise RuntimeError(f"API unreachable: {e}") from e
+        if response.stop_reason == "max_tokens":
+            log("WARN: reply hit max_tokens; names may be missing")
+        return "".join(block.text for block in response.content if block.type == "text")
+
+    def _ask_local(self, system, user):
+        import urllib.request
+        body = json.dumps({
+            "model": self.cfg["local_model"],
+            "max_tokens": 512,
+            "temperature": 0.2,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+        }).encode()
+        req = urllib.request.Request(
+            self.cfg["local_url"], data=body,
+            headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.cfg["request_timeout"]) as f:
+            return json.load(f)["choices"][0]["message"]["content"]
+
+    def parse(self, raw):
+        m = RE_JSON.search(raw or "")
+        if not m:
+            raise ValueError(f"no JSON in model reply: {(raw or '')[:200]!r}")
+        data = json.loads(m.group(0))
+        if isinstance(data.get("workspaces"), list):
+            return {str(e.get("id")): e for e in data["workspaces"] if isinstance(e, dict)}
+        return {str(k): v for k, v in data.items()}  # tolerate the keyed shape too
+
+    def clean(self, entry):
+        """Trust nothing the model said; clamp the name, validate the icon."""
+        name = str(entry.get("name", "")).strip().strip(".\"'").lower()
+        name = re.sub(r"\s+", " ", name)[: self.cfg["max_name_chars"]].strip()
+        icon = str(entry.get("icon", "")).strip().lower().replace("_", "-")
+        icon = re.sub(r"^ph[-.]", "", icon)
+        icon = re.sub(r"-(fill|bold|light|thin|duotone|regular)$", "", icon)
+        if self.icons and icon not in self.icons:
+            icon = "app-window" if "app-window" in self.icons else ""
+        return {"name": name, "icon": icon} if name else None
+
+    def name_workspaces(self, pending, previous):
+        answer = self.parse(self.ask(system_prompt(self.cfg["max_name_chars"]),
+                                     user_prompt(pending, previous)))
+        return {ws: self.clean(answer.get(ws) or {}) for ws in pending}
+
+    # -------------------------------------------------------------------- pass
+
+    def run_pass(self):
+        with self.pass_lock:
+            try:
+                current = self.snapshot()
+            except Exception as e:
+                log("snapshot failed:", e)
+                return
+            self.apply(current)
+
+    def apply(self, current):
+        pending, resolved, sigs = {}, {}, {}
+        for ws, windows in current.items():
+            sig = self.signature(windows)
+            sigs[ws] = sig
+            if sig in self.cache:
+                resolved[ws] = self.cache[sig]
+            elif self.last_sigs.get(ws) == sig and ws in self.state:
+                resolved[ws] = self.state[ws]  # asked already and it failed; keep
+            else:
+                pending[ws] = windows
+
+        if pending:
+            previous = {ws: self.state[ws]["name"] for ws in pending if ws in self.state}
+            log(f"asking {self.cfg['backend']} about workspace(s) {','.join(sorted(pending, key=int))}")
+            try:
+                for ws, entry in self.name_workspaces(pending, previous).items():
+                    if entry:
+                        resolved[ws] = entry
+                        self.cache[sigs[ws]] = entry
+                write_atomic(CACHE_PATH, self.cache)
+            except Exception as e:
+                log("naming failed:", e)
+                for ws in pending:
+                    if ws in self.state:
+                        resolved[ws] = self.state[ws]
+
+        self.last_sigs = sigs
+        if resolved != self.state:
+            self.state = resolved
+            write_atomic(STATE_PATH, resolved)
+            log("wrote", ", ".join(f"{k}={v['name']}/{v['icon']}"
+                                   for k, v in sorted(resolved.items(), key=lambda kv: int(kv[0])))
+                or "(empty)")
+
+    # ------------------------------------------------------------------- test
+
+    def test(self, fixture_path):
+        fixture = load_json(fixture_path, None)
+        if not isinstance(fixture, dict):
+            sys.exit(f"cannot read fixture {fixture_path}")
+        pending = {}
+        for ws, windows in fixture.items():
+            if not ws.isdigit():
+                continue
+            pending[ws] = sorted((cls, clean_title(title)[: self.cfg["max_title_chars"]])
+                                 for cls, title in windows)
+        t0 = time.time()
+        try:
+            result = self.name_workspaces(pending, {})
+        except RuntimeError as e:  # a config/auth problem, not a bug: no traceback
+            sys.exit(f"naming failed: {e}")
+        print(f"backend={self.backend()} model={self.cfg['model']} "
+              f"{len(pending)} workspaces in {time.time() - t0:.1f}s\n")
+        for ws in sorted(pending, key=int):
+            entry = result.get(ws) or {"name": "??", "icon": "??"}
+            print(f"{ws:>2}  {entry['name']:<18} {entry['icon']:<18}  "
+                  + " | ".join(f"[{c}] {t}" for c, t in pending[ws]))
+
+    # ------------------------------------------------------------------ events
+
+    def schedule(self):
+        """Debounce, with a ceiling: a stream of events still yields a pass
+        within max_wait of the first one."""
+        now = time.monotonic()
+        with self.lock:
+            if self.timer:
+                self.timer.cancel()
+            if self.first_event is None:
+                self.first_event = now
+            delay = min(self.cfg["debounce"], max(0.0, self.first_event + self.cfg["max_wait"] - now))
+            self.timer = threading.Timer(delay, self.fire)
+            self.timer.daemon = True
+            self.timer.start()
+
+    def fire(self):
+        with self.lock:
+            self.first_event = None
+        self.run_pass()
+
+    def listen_forever(self):
+        """Reconnect rather than die: the socket goes away on Hyprland reload."""
+        while True:
+            try:
+                self.listen()
+            except Exception as e:
+                log("listener stopped:", e)
+            time.sleep(2)
+
+    def listen(self):
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        if not sig:
+            raise RuntimeError("HYPRLAND_INSTANCE_SIGNATURE unset -- is Hyprland running?")
+        path = f"{runtime}/hypr/{sig}/.socket2.sock"
+
+        watched = ("openwindow", "closewindow", "movewindowv2",
+                   "windowtitlev2", "workspacev2", "createworkspacev2",
+                   "destroyworkspacev2")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(path)
+        log("listening on", path)
+        self.schedule()  # name what's already open
+
+        buf = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise RuntimeError("hyprland socket closed")
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                event = line.decode("utf-8", "replace").split(">>", 1)[0]
+                if event in watched:
+                    self.schedule()
+
+
+if __name__ == "__main__":
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    namer = Namer()
+    if "--test" in sys.argv:
+        namer.test(sys.argv[sys.argv.index("--test") + 1])
+    elif "--once" in sys.argv:
+        namer.run_pass()
+    else:
+        namer.listen_forever()

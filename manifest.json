@@ -3,12 +3,21 @@
   "id": "literate.bar",
   "name": "Literate Bar",
   "version": "1.0.0",
-  "author": "Omarchy",
-  "description": "The Omarchy bar with the empty-bar click gestures removed",
+  "author": "andyszy",
+  "description": "Omarchy's bar without the misclick gestures, and workspaces named by a model",
   "kinds": [
-    "bar"
+    "bar",
+    "bar-widget"
   ],
   "entryPoints": {
-    "bar": "Bar.qml"
+    "bar": "Bar.qml",
+    "barWidget": "Workspaces.qml"
+  },
+  "barWidget": {
+    "displayName": "Literate Workspaces",
+    "description": "Workspaces named by a model, with a Phosphor icon each",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "left"
   }
 }

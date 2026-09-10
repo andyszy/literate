@@ -1,0 +1,36 @@
+#!/bin/bash
+# Set up what the plugin can't ship: the daemon's venv, a PATH entry for it,
+# and the autostart line. Idempotent. Prints the snippet rather than editing
+# your Hyprland config behind your back.
+
+set -euo pipefail
+
+PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV="$HOME/.local/share/literate-workspaces/venv"
+BIN="$HOME/.local/bin/literate-workspace-namer"
+
+if [[ ! -x $VENV/bin/python ]]; then
+  echo "Creating venv with the Anthropic SDK at $VENV"
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install --quiet anthropic
+fi
+
+mkdir -p "$HOME/.local/bin" "$HOME/.config/literate-workspaces"
+ln -sfn "$PLUGIN/bin/literate-workspace-namer" "$BIN"
+echo "Linked $BIN"
+
+cat <<SNIPPETS
+
+Now give the daemon a credential -- an API key in
+  ~/.config/literate-workspaces/api-key   (chmod 600)
+or ANTHROPIC_API_KEY in the session environment. Without one it falls back
+to the Claude Code CLI, which is slower.
+
+Add to ~/.config/hypr/autostart.lua:
+
+  o.launch_on_start("literate-workspace-namer")
+
+Then: hyprctl reload, and start it once by hand:
+
+  hyprctl dispatch 'hl.dsp.exec_cmd("uwsm-app -- literate-workspace-namer")'
+SNIPPETS
