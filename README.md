@@ -1,183 +1,102 @@
-# Omarchy bar
+# Literate Bar
 
-This is the Quickshell implementation of the Omarchy status bar. It is
-shipped as a first-party plugin of [`omarchy-shell`](../../README.md), the
-long-running shell host. The bar is mounted at startup and lives inside
-the shell for its whole session.
+The Omarchy status bar with the empty-bar click gestures removed.
 
-- `manifest.json` declares the plugin (`id: omarchy.bar`, `kind: bar`) and points at `Bar.qml` as the entry point.
-- `Bar.qml` is Omarchy-owned bar engine code, loaded by the omarchy-shell host. Users should not edit it directly.
-- `widgets/` holds simple first-party bar widgets with sibling manifests.
-- Feature plugins such as `../panels/audio/`, `../panels/network/`, `../panels/power/`, and `../agents/` provide richer popup bar plugins.
-- The bar receives its config from the host shell as a `barConfig` property; the host loads it from `~/.config/omarchy/shell.json` (or `config/omarchy/shell.json` when the user has no file).
-- `omarchy bar position` updates only the user shell.json file.
+Upstream's bar treats the blank stretch between widgets as a control surface:
 
-## Customizing
+- **double-click** toggles `bar.transparent`, and persists it to `shell.json`
+- **drag** (or press-and-hold, then drag) moves the bar to the nearest screen
+  edge, which reflows every tiled window
 
-The bar config lives under the `bar:` key of [`~/.config/omarchy/shell.json`](../../README.md#shelljson-shape). Out of the box the shell uses [`config/omarchy/shell.json`](../../../config/omarchy/shell.json). Once you customize anything via the bar gestures, `omarchy bar ...`, or by editing shell.json directly, your file is canonical — there is no deep-merge.
+Both fire on ordinary misclicks, and both write to your config, so a slip is
+sticky rather than transient. This fork deletes the `CenterGestureArea`
+`MouseArea` that owns them. The bar's position is then whatever `shell.json`
+says and nothing but an edit can change it.
 
-The bar is configured directly on the bar itself: drag empty bar space (or click-and-hold) to move the bar to another screen edge, double-left-click empty center-bar space to toggle transparency, and drag widgets to reorder them. The `omarchy bar position`, `omarchy bar transparent`, `omarchy bar move`, and `omarchy bar set` commands do the same from scripts. Enable or disable widgets with `omarchy plugin enable` and `omarchy plugin disable` (widget ids come from `omarchy plugin list`).
+Dragging individual *widgets* to rearrange them still works — that is a
+separate handler and is untouched.
 
-Example `shell.json` (bar subtree only shown):
+## Install
 
-```json
-{
-  "version": 1,
-  "bar": {
-    "position": "top",
-    "transparent": false,
-    "centerAnchor": "omarchy.clock",
-    "layout": {
-      "left": [
-        { "id": "omarchy.menu" },
-        { "id": "omarchy.spacer", "size": 12 },
-        { "id": "omarchy.workspaces" }
-      ],
-      "center": [
-        { "id": "omarchy.media" },
-        { "id": "omarchy.clock", "format": "HH:mm" }
-      ],
-      "right": [
-        { "id": "omarchy.audio" },
-        { "id": "omarchy.power" }
-      ]
-    }
-  }
-}
+```bash
+omarchy plugin add https://github.com/andyszy/literate-bar.git --enable
 ```
 
-`centerAnchor` pins one center module to the exact horizontal/vertical center and flanks others around it. Set to an empty string to disable anchoring (the center list is centered as a group).
+Then confirm it took:
 
-## Module catalogue
+```bash
+hyprctl layers | grep omarchy-bar     # the layer should be present
+```
 
-### First-party interactive widgets
+Remove it with `omarchy plugin remove literate.bar`, which restores the
+built-in bar.
 
-| Name | What it does | Interactions |
+## Which branch you want
+
+The Omarchy bar is vendored, not subclassed — QML gives no way to reach into a
+nested component and delete a gesture from outside. So this repo carries a full
+copy of the bar, and the copy has to match the shell it runs against: `Bar.qml`
+imports `Style`, `Color` and `BarModel` from the host, and those drift between
+releases.
+
+| Branch | Vendored from | For |
 |---|---|---|
-| `omarchy.menu` | Omarchy menu launcher | left = menu · right = terminal |
-| `omarchy.workspaces` | Hyprland workspace switcher | left = focus workspace |
-| `omarchy.clock` | Date/time label + popup with a month grid, ISO week numbers, and month stepping | left = popup · right = cycle label format · middle = timezone selector |
-| `omarchy.media` | MPRIS now-playing — scrolling track + artist, cover-art popup | left = play/pause · middle = next · scroll = prev/next · right = popup |
-| `omarchy.indicators` | Manual state indicators | left = indicator action |
-| `omarchy.system-update` | Available update indicator | left = update |
-| `omarchy.tray` | System tray | hover = reveal drawer · right on chevron = manage |
-| `omarchy.weather` | Weather icon + popup with forecast | left = popup · right = full notification |
-| `omarchy.microphone` | Mic icon + scroll volume | left = mute toggle · middle = audio panel · scroll = source volume |
+| `main-mac` (default) | [`omarchy-mac/omarchy-mac`](https://github.com/omarchy-mac/omarchy-mac) | Omarchy on Apple Silicon |
+| `main-basecamp` | [`basecamp/omarchy`](https://github.com/basecamp/omarchy) `v4.0.3` | mainline Omarchy |
+| `upstream-mac`, `upstream-basecamp` | — | pristine vendor bases, no patches |
 
-| `omarchy.audio` | Volume icon + popup with master slider, output-device picker, per-app mixer | left = popup · right = mute · middle = popup · scroll = volume |
-| `omarchy.network` | Wi-Fi/Ethernet icon + popup with Wi-Fi scan, signal, connect, DNS provider selection | left = popup |
-| `omarchy.tailscale` | Tailscale status, connection switcher, machine browser, and copy actions | left = popup · right = toggle · middle = refresh |
-| `omarchy.agents` | AI coding agent limits with pace, today, last week, and all-time model breakdown | left = panel · right = launch agent · middle = next subscription |
-| `omarchy.power` | Battery/AC icon + popup with battery stats, power profiles, and system info | left = popup · right = toggle percentage |
-| `omarchy.bluetooth` | Bluetooth icon + popup with device list, connect/disconnect, battery | left = popup · right = toggle radio |
-| `omarchy.monitor` | Brightness and laptop display controls | left = popup |
+`main-mac` is the default branch because `omarchy plugin update` fetches
+`origin HEAD` and merges `--ff-only`; a default branch you are not tracking
+makes every update fail to fast-forward.
 
-The `omarchy.indicators` widget loads individual bar indicators from `indicators/`. Omit `items` (or set it to an empty array) to show all indicators in the default order, or set `items` to a subset such as `["Dnd", "Reminder", "NightLight"]`. Set `alwaysShow` to `true` to keep inactive indicators visible instead of revealing them only on hover. Multiple `omarchy.indicators` instances are allowed, so different sections can show different subsets.
+On mainline Omarchy, install the other branch by hand:
 
-## Orientation
-
-All widgets work in `top`, `bottom`, `left`, and `right` positions. Popups anchor on the side opposite the bar edge, sliding into the workspace. Vertical bars use 28px width; widgets that show text fall back to compact icon-only forms (e.g. `media` hides its scrolling label).
-
-## Custom user modules
-
-The schema accepts arbitrary module ids that you provide. Set `type` to `command` for shell-driven output or `qml` for a custom QML widget. Both still go under `bar.layout.<section>` in `shell.json`.
-
-Command module:
-
-```json
-{
-  "version": 1,
-  "bar": {
-    "layout": {
-      "right": [
-        { "id": "omarchy.tray" },
-        { "id": "vpn", "type": "command", "exec": "~/.config/omarchy/bar/scripts/vpn-status", "interval": 5, "tooltip": "VPN", "onClick": "nm-connection-editor" },
-        { "id": "omarchy.audio" }
-      ]
-    }
-  }
-}
+```bash
+git clone -b main-basecamp https://github.com/andyszy/literate-bar.git \
+  ~/.config/omarchy/plugins/literate.bar
+omarchy plugin enable literate.bar
 ```
 
-The command may print plain text or Waybar-style JSON, for example:
+If neither branch matches your Omarchy, re-vendor from your own install —
+see below.
 
-```json
-{"text":"󰌆","tooltip":"Work VPN","class":"active"}
+## The patches
+
+Kept as a script rather than as commits, so they can be replayed onto a new
+upstream instead of rebased through conflicts. `tools/apply-patches.py` is
+idempotent and exits non-zero if a patch site has changed shape, so a bad
+re-sync fails loudly instead of shipping a half-patched bar.
+
+1. **Rename the plugin** — `manifest.json` becomes `literate.bar` /
+   "Literate Bar". The `omarchy.*` id namespace is reserved.
+2. **Un-require the host-injected properties** *(mac branch only)* —
+   `shell.qml` loads a non-default bar with `Loader { source: url }` and only
+   then assigns `omarchyPath`, `barWidgetRegistry` and `barConfig`, in
+   `configureBar()` from `onLoaded`. QML required properties must be supplied
+   at construction, so declaring them `required` makes **any** third-party bar
+   fail with *"Required property was not initialized"* — and the fallback to
+   the built-in bar throws `ReferenceError: errorString is not defined`, so
+   the failure leaves you with no bar at all. `basecamp/omarchy` already
+   declares these as plain properties (*"declaring it keeps clone construction
+   atomic"*); the `omarchy-mac` fork regressed them, so only that branch needs
+   this.
+3. **Remove `CenterGestureArea`** — the actual point of the fork.
+
+## Re-syncing after an Omarchy release
+
+```bash
+git checkout upstream-mac
+tools/sync-upstream                      # or: tools/sync-upstream /path/to/checkout
+git commit -am "Vendor bar from omarchy-mac <version>"
+git checkout main-mac && git merge upstream-mac
 ```
 
-QML module:
+`tools/sync-upstream` re-vendors every file upstream ships, preserving this
+fork's `README.md` and `tools/`, then re-applies the patches. Repeat for
+`upstream-basecamp` / `main-basecamp`.
 
-```json
-{
-  "version": 1,
-  "bar": {
-    "layout": {
-      "right": [
-        { "id": "gpu", "type": "qml" },
-        { "id": "omarchy.audio" }
-      ]
-    }
-  }
-}
-```
+## Credit and license
 
-Then create `~/.config/omarchy/bar/modules/gpu.qml`. If you want to store it elsewhere, add a `source` path.
-
-Custom QML modules should be an `Item` with `implicitWidth` and `implicitHeight`. They may optionally define these properties, which the bar fills after loading:
-
-```qml
-import QtQuick
-
-Item {
-  property var bar
-  property string moduleName
-  property var settings
-
-  implicitWidth: 28
-  implicitHeight: bar ? bar.barSize : 26
-
-  Text {
-    anchors.centerIn: parent
-    text: "GPU"
-    color: bar ? bar.foreground : "white"
-    font.family: bar ? bar.fontFamily : "monospace"
-    font.pixelSize: 12
-  }
-
-  MouseArea {
-    anchors.fill: parent
-    onClicked: if (bar) bar.run("omarchy-launch-or-focus-tui btop")
-  }
-}
-```
-
-## Bar properties available to widgets
-
-Widgets receive `bar` (the shell root), `moduleName` (string), and `settings` (object) injected at load time. The bar exposes:
-
-- `bar.foreground`, `bar.background`, `bar.urgent` — theme colors (live-updated)
-- `bar.fontFamily` — current monospace family
-- `bar.position` — `"top" | "bottom" | "left" | "right"`
-- `bar.vertical` — boolean shortcut
-- `bar.barSize` — 26 horizontal / 28 vertical
-- `bar.run(command)` — fire-and-forget bash exec
-- `bar.shellQuote(value)` — safe shell-quote a string
-- `bar.showTooltip(target, text)` / `bar.hideTooltip(target)` — shared tooltip popup
-- `bar.requestPopout(owner)` / `bar.releasePopout(owner)` — one-popup-at-a-time coordinator
-
-First-party bar widgets are manifest-backed just like third-party widgets.
-Simple widgets carry sibling manifests such as `widgets/Workspaces.manifest.json`;
-richer popup plugins live in feature directories such as `../panels/audio/`,
-`../panels/network/`, and `../agents/`; and feature plugins such as
-`omarchy.menu` and `omarchy.media` declare their bar-widget entry points in their own
-`manifest.json`. Bar layout ids are namespaced, e.g. `omarchy.audio`,
-`omarchy.network`, and `omarchy.clock`. Older UpperCamelCase ids such as
-`AudioPanel` and `Clock` are migrated forward; new configs should use the
-namespaced ids.
-
-Third-party widgets ship as separate plugins under
-`~/.config/omarchy/plugins/<plugin-id>/` with their own `manifest.json`
-declaring `kinds: ["bar-widget"]` and a `barWidget` entry point. See
-[../../README.md](../../README.md) for the manifest schema. Rescan, enable,
-and place third-party plugins with `omarchy-shell shell rescanPlugins`,
-`omarchy plugin enable`, and `omarchy bar move`.
+All of the interesting code is Omarchy's, by DHH and the Omarchy contributors,
+MIT licensed. This fork is three small patches on top; the upstream license and
+copyright carry over unchanged.

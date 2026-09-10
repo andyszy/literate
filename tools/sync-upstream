@@ -1,0 +1,36 @@
+#!/bin/bash
+
+# Re-vendor the bar from an upstream checkout and re-apply the Literate Bar
+# patches. Run this on the matching upstream-* branch after a new Omarchy
+# release, then merge that branch into its main-* branch.
+#
+#   tools/sync-upstream /path/to/omarchy-checkout
+#   tools/sync-upstream                # defaults to the installed Omarchy
+#
+# The vendored copy must match the Omarchy shell it runs against: Bar.qml
+# imports Style, Color and BarModel from the host shell, so a bar vendored
+# from a different release can break on API drift.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SOURCE_ROOT="${1:-${OMARCHY_PATH:-/usr/share/omarchy}}"
+BAR_DIR="$SOURCE_ROOT/shell/plugins/bar"
+
+[[ -d $BAR_DIR ]] || {
+  echo "sync-upstream: no bar plugin at $BAR_DIR" >&2
+  exit 1
+}
+
+# Vendor everything upstream ships, but keep what this fork owns: our README,
+# our tools, and git's own directory.
+rsync -a --delete \
+  --exclude .git \
+  --exclude README.md \
+  --exclude tools \
+  "$BAR_DIR/" "$REPO_ROOT/"
+
+python3 "$REPO_ROOT/tools/apply-patches.py" "$REPO_ROOT"
+
+echo "Vendored from $BAR_DIR"
+git -C "$REPO_ROOT" status --short
