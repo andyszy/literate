@@ -464,6 +464,19 @@ more often than a naming pass.
   rather than erroring, so it's worth spot-checking a real row's date after
   touching this.
 
+- **`typed_count` is the ranking signal, not `visit_count`.** Chrome records
+  how often each URL was reached by someone *typing* it rather than following a
+  link, and that is the only column that separates a destination from a page:
+  379 of 13,077 URLs here have one at all (gmail.com 90, calendar.google.com
+  74, news.google.com 39), and it is why "gm" can mean gmail.com. Ranking on
+  visits and recency answers "what did I look at" -- a fine history search and
+  the wrong answer for an address bar, where every query is a navigation.
+  `Omnibox.compareHistory()` therefore sorts on match tier, then typed count,
+  then visits and recency as tiebreakers, and `_typed_rows()` fetches typed
+  URLs per profile *outside* the recency sample so one afternoon of
+  link-following cannot push a weekly destination out of the index. Hidden rows
+  stay a floor top-up even when typed: a redirect Chrome refuses to
+  autocomplete is not a destination.
 - Both sources are capped (`OMNIBOX_CONV_LIMIT`, `OMNIBOX_HISTORY_LIMIT`) so
   the JSON stays small enough for a UI to hold in memory and filter locally.
 - The daemon also rebuilds the index opportunistically, the same shape as
