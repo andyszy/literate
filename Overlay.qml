@@ -146,14 +146,16 @@ Item {
   function ping() { return "ok" }
 
   // IPC entry point for the SUPER+SHIFT+<n> binds in the "literate-triage"
-  // Hyprland submap (see bindings.lua): moves the highlighted row's whole
-  // category to workspace `arg`, then closes -- what pressing digit N used
-  // to do directly, before digits became Triage.qml's search box. Lives
-  // here rather than on Triage.qml because only this Item is the manifest
-  // entry point the host (and `omarchy-shell shell call`) can reach.
+  // Hyprland submap (see bindings.lua): moves to workspace `arg` whatever is
+  // highlighted, then closes -- what pressing digit N used to do directly,
+  // before digits became Triage.qml's search box. Scope follows the cursor:
+  // a window row moves just that window, a category header moves every
+  // window in the category (see Triage.qml's moveCurrent()). Lives here
+  // rather than on Triage.qml because only this Item is the manifest entry
+  // point the host (and `omarchy-shell shell call`) can reach.
   function triageMove(arg) {
     if (!root.opened || !root.triageMode) return "not in triage"
-    triageView.moveCurrentCategory(String(arg))
+    triageView.moveCurrent(String(arg))
     return "ok"
   }
 
