@@ -102,10 +102,10 @@ Item {
 
   // ------------------------------------------------------------------- rows
   //
-  // Flattened list of header rows (one per category) and window rows,
-  // in category order. Keyboard/click selection only ever lands on a
-  // window row -- computeSelectableRows() is the map from "row you can
-  // land on" back to its position in `rows`.
+  // Flattened list of header rows (one per category) and window rows, in
+  // category order. Keyboard/click selection can land on either kind --
+  // computeSelectableRows() is the map from "row you can land on" back to
+  // its position in `rows` (currently every row, see its own comment).
 
   readonly property var rows: root.computeRows()
 
@@ -113,7 +113,9 @@ Item {
   // whose OWN name matches keeps every window (the match already explains
   // the whole group); otherwise only the windows that individually match
   // survive, and a category left with none is dropped rather than shown
-  // with an empty body.
+  // with an empty body. That drop applies whether or not there is a query --
+  // a header for a category with zero visible windows is never emitted, so
+  // it can never be landed on (see computeSelectableRows()).
   function computeRows() {
     var out = []
     var hasQuery = root.query.length > 0
@@ -129,7 +131,7 @@ Item {
             visible.push(indices[i])
         }
       }
-      if (hasQuery && visible.length === 0) continue
+      if (visible.length === 0) continue
 
       out.push({ kind: "header", categoryIndex: c, name: cat.name, icon: cat.icon,
                  count: visible.length })
@@ -152,12 +154,17 @@ Item {
     return n
   }
 
+  // Every row lands on something selectable now -- a header is a stop in its
+  // own right (arrow nav walks header -> its windows -> next header -> ...),
+  // and computeRows() already drops any header left with zero visible rows.
+  // So this is the identity map over `rows`; kept as its own function/array
+  // (rather than indexing `rows` directly) so currentRow()/select()/
+  // selectRow() below don't change shape.
   readonly property var selectableRows: root.computeSelectableRows()
 
   function computeSelectableRows() {
     var out = []
-    for (var i = 0; i < root.rows.length; i++)
-      if (root.rows[i].kind === "window") out.push(i)
+    for (var i = 0; i < root.rows.length; i++) out.push(i)
     return out
   }
 
@@ -166,6 +173,25 @@ Item {
     if (sel.length === 0) return null
     var pos = Math.max(0, Math.min(root.cursor, sel.length - 1))
     return root.rows[sel[pos]]
+  }
+
+  // Which category the cursor currently sits in (header or window row alike)
+  // -- drives the whole-category scope tint below, so it's obvious at a
+  // glance which windows a header-level move would take.
+  readonly property int currentCategoryIndex: {
+    var row = root.currentRow()
+    return row ? row.categoryIndex : -1
+  }
+
+  // What SUPER+SHIFT+<digit> and Enter will do to the current selection --
+  // shown in the header so the scope of a header-level move is legible
+  // before it happens, not after.
+  readonly property string scopeHint: {
+    var row = root.currentRow()
+    if (!row) return ""
+    if (row.kind === "header")
+      return "⇧⌘1-9 move all " + row.count + (row.count === 1 ? " window" : " windows")
+    return "⇧⌘1-9 move this window"
   }
 
   function select(delta) {
@@ -184,14 +210,25 @@ Item {
 
   // ---------------------------------------------------------------- actions
 
+  // On a window row, focus that window. On a header, focus the category's
+  // first (visible) window -- computeRows() guarantees the row immediately
+  // after a header is a window of that same category, since a header with
+  // no visible windows is never emitted.
   function focusCurrent() {
     var row = root.currentRow()
-    if (!row || !row.window || !row.window.address) return
+    if (!row) return
+    var win = row.window
+    if (row.kind === "header") {
+      var flat = root.selectableRows[root.cursor]
+      var next = root.rows[flat + 1]
+      win = next ? next.window : null
+    }
+    if (!win || !win.address) return
     // This Hyprland is Lua-configured: `hyprctl dispatch` is shorthand for
     // hl.dispatch(...), so the classic "focuswindow address:0x.." string is
     // a Lua syntax error, not a dispatch. See CLAUDE.md.
     focusProc.command = ["hyprctl", "dispatch",
-      'hl.dsp.focus({ window = "address:' + row.window.address + '" })']
+      'hl.dsp.focus({ window = "address:' + win.address + '" })']
     focusProc.running = true
     root.closeRequested()
   }
@@ -200,23 +237,34 @@ Item {
   // the SUPER+SHIFT+<n> binds in the "literate-triage" Hyprland submap (see
   // bindings.lua) -- not from handleKey() any more, since plain digits now
   // feed the search box.
-  function moveCurrentCategory(target) {
+  //
+  // Scope follows the cursor: a window row moves just that window; a header
+  // moves every window in the category (its full index list, not just what
+  // the current search happens to show -- unchanged from this function's
+  // original category-only behaviour).
+  function moveCurrent(target) {
     var row = root.currentRow()
     if (!row) return
-    var cat = root.categories[row.categoryIndex]
-    if (!cat) return
     var addrs = []
-    var indices = cat.indices || []
-    for (var i = 0; i < indices.length; i++) {
-      var w = root.windowByIndex(indices[i])
-      if (w && w.address) addrs.push(w.address)
+    if (row.kind === "header") {
+      var cat = root.categories[row.categoryIndex]
+      var indices = (cat && cat.indices) || []
+      for (var i = 0; i < indices.length; i++) {
+        var w = root.windowByIndex(indices[i])
+        if (w && w.address) addrs.push(w.address)
+      }
+    } else if (row.window && row.window.address) {
+      addrs.push(row.window.address)
     }
     if (addrs.length > 0) {
       var dispatches = []
       for (var j = 0; j < addrs.length; j++)
-        // Same Lua dispatcher form as Overlay.qml's spin-out.
+        // follow = true, not false: the user asked these windows to go to
+        // `target` because they intend to go there themselves. Same Lua
+        // dispatcher form as Overlay.qml's spin-out (which stays silent --
+        // a different feature, not in scope here).
         dispatches.push('dispatch hl.dsp.window.move({ workspace = "' + target
-          + '", follow = false, window = "address:' + addrs[j] + '" })')
+          + '", follow = true, window = "address:' + addrs[j] + '" })')
       moveProc.command = ["hyprctl", "--batch", dispatches.join(" ; ")]
       moveProc.running = true
     }
@@ -419,6 +467,8 @@ Item {
       anchors.verticalCenter: parent.verticalCenter
       // The " · refreshing…" tail is the whole of the drift hint: rows that
       // are already readable do not deserve a bar drawn over the top of them.
+      // The scope hint trails everything else -- it's the least essential
+      // part of the line, so it's the first thing elide sacrifices.
       text: (root.query.length > 0
         ? ("Search: " + root.query + "▮"
            + " · " + root.visibleWindowCount + (root.visibleWindowCount === 1 ? " window" : " windows")
@@ -427,6 +477,7 @@ Item {
             ? (" · " + root.windows.length + (root.windows.length === 1 ? " window" : " windows")
                + " · " + root.categories.length + (root.categories.length === 1 ? " category" : " categories"))
             : ""))) + (root.refreshing ? " · refreshing…" : "")
+        + (root.scopeHint ? " · " + root.scopeHint : "")
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.heading
@@ -526,17 +577,29 @@ Item {
       required property var modelData
 
       readonly property bool isHeader: rowRoot.modelData.kind === "header"
-      readonly property bool hasCursor: !rowRoot.isHeader
-        && root.selectableRows[root.cursor] === rowRoot.index
+      readonly property bool hasCursor: root.selectableRows[root.cursor] === rowRoot.index
+      // Whole-category scope cue: every row (header or window) belonging to
+      // the category the cursor is currently in, so it's obvious at a glance
+      // which windows a header-level move would take. Drawn under, and kept
+      // subordinate to, the cursor's own highlight below -- the cursor row
+      // must still read as the primary selection.
+      readonly property bool inScopeCategory: rowRoot.modelData.categoryIndex === root.currentCategoryIndex
 
       width: listView.width
       height: rowRoot.isHeader ? root.catHeaderHeight : root.rowHeight
 
       Rectangle {
         anchors.fill: parent
-        visible: !rowRoot.isHeader
+        visible: rowRoot.inScopeCategory && !rowRoot.hasCursor
         radius: Style.cornerRadius
-        color: rowRoot.hasCursor ? root.selectedBackground : "transparent"
+        color: Util.alpha(root.foreground, 0.045)
+      }
+
+      Rectangle {
+        anchors.fill: parent
+        visible: rowRoot.hasCursor
+        radius: Style.cornerRadius
+        color: root.selectedBackground
       }
 
       Row {
@@ -549,7 +612,7 @@ Item {
         Text {
           visible: rowRoot.isHeader && root.glyph(rowRoot.modelData.icon) !== ""
           text: rowRoot.isHeader ? root.glyph(rowRoot.modelData.icon) : ""
-          color: root.foreground
+          color: rowRoot.hasCursor ? root.selectedText : root.foreground
           font.family: phosphor.font.family
           font.pixelSize: Style.font.body
         }
@@ -557,7 +620,7 @@ Item {
         Text {
           textFormat: Text.PlainText
           text: rowRoot.isHeader ? (rowRoot.modelData.name + " (" + rowRoot.modelData.count + ")") : ""
-          color: root.foreground
+          color: rowRoot.hasCursor ? root.selectedText : root.foreground
           font.family: root.fontFamily
           font.bold: true
           font.pixelSize: Style.font.body
@@ -583,8 +646,6 @@ Item {
 
       MouseArea {
         anchors.fill: parent
-        visible: !rowRoot.isHeader
-        enabled: !rowRoot.isHeader
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
         onEntered: root.selectRow(rowRoot.index)
