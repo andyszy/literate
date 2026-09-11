@@ -407,6 +407,13 @@ Item {
         subject: meta.subject || Omnibox.stripStatusGlyphs(t.title),
         context: meta.context || "",
         host: meta.host || "",
+        // Which Chrome profile this window belongs to, when the daemon could
+        // tell (a site-app class carries it; a tabbed window needs the
+        // extension's report). Empty means unknown, and unknown must stay
+        // unmarked -- a wrong work/personal tint is worse than none.
+        profileName: meta.profileName || "",
+        profileColor: meta.profileColor || "",
+        profileTextColor: meta.profileTextColor || "",
         lastFocus: meta.lastFocus === undefined ? null : meta.lastFocus
       }
       if (!buckets[ws]) buckets[ws] = []
@@ -1744,20 +1751,30 @@ Item {
                 // The app name sits on the thumbnail in a small opaque chip.
                 // No gradient scrim: it would grey out the top of every
                 // window, which is exactly the part that identifies it.
+                //
+                // A Chrome window's chip is tinted with its PROFILE's colour,
+                // derived from Chrome's own profile_color_seed and matching
+                // the window title bars, so which account a thumbnail belongs
+                // to is readable at a glance without a second badge competing
+                // with the name. Everything else keeps the neutral chip, and
+                // so does a Chrome window whose profile could not be
+                // established.
                 Rectangle {
                   anchors.centerIn: parent
                   width: Math.min(parent.width - Style.space(4),
                                   chipText.implicitWidth + Style.space(10))
                   height: chipText.implicitHeight + Style.space(3)
                   radius: Math.max(1, Style.space(3))
-                  color: root.panelBackground
+                  color: cell.modelData.profileColor ? cell.modelData.profileColor
+                                                     : root.panelBackground
                   Text {
                     id: chipText
                     anchors.centerIn: parent
                     width: Math.min(implicitWidth, parent.width - Style.space(6))
                     textFormat: Text.PlainText
                     text: cell.modelData.app
-                    color: root.panelText
+                    color: cell.modelData.profileTextColor
+                      ? cell.modelData.profileTextColor : root.panelText
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                     font.bold: true

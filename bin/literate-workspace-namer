@@ -24,6 +24,7 @@ an icon. Results land in a JSON file the bar widget watches.
   literate-workspace-namer --index-omnibox       rebuild the omnibox index once; no model call, print nothing
 """
 
+import colorsys
 import hashlib
 import json
 import os
@@ -527,7 +528,11 @@ def load_chrome_tabs(state_dir=STATE_DIR, max_age=CHROME_TABS_MAX_AGE, now=None)
             # Copied, not mutated: these dicts are handed to the identity and
             # prompt code, which has no business seeing bookkeeping fields
             # change underneath it.
-            window = {**window, "updatedAt": seen, "instance": instance}
+            # The signed-in address is a property of the profile, so the
+            # extension sends it once per report; carrying it onto each window
+            # is what lets a window be attributed to an account later.
+            window = {**window, "updatedAt": seen, "instance": instance,
+                      "email": data.get("email") or ""}
             wid = window.get("id")
             if wid is None:
                 unkeyed.append(window)
@@ -1221,6 +1226,108 @@ def omnibox_profiles(selected=None, primary=None):
             for i, (directory, name) in enumerate(ordered)]
 
 
+def profile_chip_colors(seed):
+    """(chip background, chip text) for a Chrome profile_color_seed.
+
+    Chrome stores the seed as a signed 32-bit ARGB int -- the saturated colour
+    it paints its own profile chrome with, far too strong to sit under a
+    window title. Pushing lightness to 0.93 at 85% of the saturation gives the
+    Tailwind "-100" weight the title bars already use (verified: seed
+    -3413569 -> #EAF5E6, -336013 -> #FBF6DF), and the text is the same hue at
+    22% lightness and a quarter of the saturation, which lands on the same
+    near-neutral as those bars' text rather than a saturated ink.
+
+    Derived rather than hardcoded so a third profile, or someone changing a
+    profile colour in Chrome, simply works.
+    """
+    try:
+        value = int(seed) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return None
+    red, green, blue = (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF
+    hue, _light, sat = colorsys.rgb_to_hls(red / 255, green / 255, blue / 255)
+
+    def to_hex(rgb):
+        return "#%02X%02X%02X" % tuple(round(channel * 255) for channel in rgb)
+
+    return (to_hex(colorsys.hls_to_rgb(hue, 0.93, min(1.0, sat * 0.85))),
+            to_hex(colorsys.hls_to_rgb(hue, 0.22, min(1.0, sat * 0.25))))
+
+
+def chrome_profile_meta():
+    """{directory: {name, email, color, textColor}} from Local State.
+
+    info_cache is the only place a profile's human name, its signed-in address
+    and its colour seed are written down, and this is the same file
+    chrome_profile_dirs() already reads every pass -- 14 KB, so free.
+    """
+    local_state = load_json(CHROME_LOCAL_STATE, {})
+    cache = (local_state.get("profile", {}) or {}).get("info_cache") \
+        if isinstance(local_state, dict) else None
+    meta = {}
+    if not isinstance(cache, dict):
+        return meta
+    for directory, entry in cache.items():
+        if not isinstance(entry, dict):
+            continue
+        colors = profile_chip_colors(entry.get("profile_color_seed"))
+        meta[str(directory)] = {
+            "name": str(entry.get("name") or directory),
+            "email": str(entry.get("user_name") or "").lower(),
+            "color": colors[0] if colors else "",
+            "textColor": colors[1] if colors else "",
+        }
+    return meta
+
+
+# The profile a Chrome site-app window's class ends with:
+# "chrome-gmail.com__-Profile_1" -> "Profile 1". The underscore is Hyprland's,
+# not Chrome's -- the directory really has a space in it.
+RE_CLASS_PROFILE = re.compile(r"-(Default|Profile[ _]\d+)$", re.I)
+
+
+def window_profile(cls, chrome_window=None, meta=None):
+    """Which Chrome profile a window belongs to, as UI fields, or {}.
+
+    Two sources, in order of how much they can be trusted:
+
+    1. The class of a site-app window, which Chrome ends with the profile
+       DIRECTORY. Free, exact, and available with no extension at all -- and
+       since every window here is becoming an app-mode window, it is the case
+       that matters most.
+    2. The `email` the literate-tabs extension reports for the profile whose
+       window this was matched to, looked up against info_cache's user_name.
+       This is the only thing that can attribute a plain tabbed window: all
+       profiles share one browser process, and every one of their windows
+       carries the identical Hyprland class.
+
+    A window that matches neither gets NOTHING, deliberately. A wrong
+    work/personal marker is worse than no marker.
+    """
+    meta = meta if meta is not None else {}
+    directory = ""
+    match = RE_CLASS_PROFILE.search(str(cls or ""))
+    if match:
+        candidate = match.group(1).replace("_", " ")
+        if candidate in meta:
+            directory = candidate
+    if not directory and isinstance(chrome_window, dict):
+        email = str(chrome_window.get("email") or "").lower()
+        if email:
+            for key, entry in meta.items():
+                if entry.get("email") and entry["email"] == email:
+                    directory = key
+                    break
+    if not directory:
+        return {}
+    entry = meta[directory]
+    fields = {"profile": directory, "profileName": entry.get("name") or directory}
+    if entry.get("color"):
+        fields["profileColor"] = entry["color"]
+        fields["profileTextColor"] = entry["textColor"]
+    return fields
+
+
 def sqlite_immutable(path):
     """Open one of Chrome's live sqlite databases read-only.
 
@@ -1697,8 +1804,10 @@ class Namer:
 
         matches = self._chrome_matches(raw)
         mode = self.cfg.get("chrome_urls", "domain")
-        identities = [window_identity(entry[1], entry[2], matches.get(i),
-                                      expose_host=mode != "off")
+        profiles = chrome_profile_meta()
+        identities = [{**window_identity(entry[1], entry[2], matches.get(i),
+                                         expose_host=mode != "off"),
+                       **window_profile(entry[1], matches.get(i), profiles)}
                       for i, entry in enumerate(raw)]
         self._enrich_chrome_titles(raw, matches)
 
