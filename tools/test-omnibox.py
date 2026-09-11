@@ -184,6 +184,32 @@ class TestSearchEngineFromChrome(unittest.TestCase):
                          namer.GOOGLE_SEARCH)
 
 
+class TestProfileMark(OmniboxJsTest):
+    """The initials a history row shows for the account(s) it is known in."""
+
+    def mark(self, row):
+        return self.call("profileMark(row)", row=row)
+
+    def test_two_profiles_read_as_two_initials(self):
+        self.assertEqual(self.mark({"profileNames": ["Andy", "tradewinds.school"]}), "AT")
+
+    def test_one_profile_reads_as_one(self):
+        self.assertEqual(self.mark({"profileNames": ["Andy"]}), "A")
+        self.assertEqual(self.mark({"profileName": "Andy"}), "A")
+
+    def test_an_array_like_that_is_not_an_Array_still_counts(self):
+        # A row arrives through a ListView model, where QML has turned the JS
+        # object into a QVariantMap and its nested array into something that
+        # indexes and has .length but fails Array.isArray. Asking isArray drew
+        # a single initial on every merged row; this is that bug, pinned.
+        got = self.call("profileMark({ profileNames: arrayLike, profileName: 'Andy' })",
+                        arrayLike={"0": "Andy", "1": "tradewinds.school", "length": 2})
+        self.assertEqual(got, "AT")
+
+    def test_no_profile_at_all_is_empty_rather_than_invented(self):
+        self.assertEqual(self.mark({}), "")
+
+
 class TestIndexAndRankingAgree(unittest.TestCase):
     """The index and the ranking are one decision in two files."""
 

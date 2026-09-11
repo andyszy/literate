@@ -691,6 +691,15 @@ The sticking point is the mapping, and Hyprland's own module solves it:
   whole `hyprctl -j clients` record (`at`, `size`, `class`, ...). So the join
   already exists: address for the daemon's data, `.wayland` for the pixels,
   `lastIpcObject` for the geometry. Never reconstruct it by title.
+- **A model row is not the object you put in it.** A JS object handed to a
+  `ListView` model comes back to the delegate as a QVariantMap, and a nested
+  array inside it indexes and has `.length` but is **not** an `Array` to the
+  JS engine. `Omnibox.profileMark()` asked `Array.isArray` and silently took
+  its one-profile branch, so every deduplicated history row drew a single
+  initial and the whole both-profiles indicator looked like it was not
+  working. Duck-type (`typeof x.length === "number"`) for anything read off a
+  delegate's `modelData`; `Array.isArray` is still fine on a plain `var`
+  property like the parsed index itself.
 - `HyprlandToplevel.address` has **no `0x` prefix**; `hyprctl` and the daemon
   both write `0xaaaa...`. Everything goes through
   `Omnibox.normalizeAddress()`, same rule as the daemon's own

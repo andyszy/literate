@@ -151,7 +151,13 @@ function urlOrSearch(query, search) {
 // has been seen; it does not say where Enter will open it -- that is the key's
 // decision and the footer's job to state.
 function profileMark(row) {
-  var names = (row && Array.isArray(row.profileNames)) ? row.profileNames
+  // NOT Array.isArray. A row reaching here came through a ListView's model,
+  // and QML converts the JS objects in a model to QVariantMap -- so a nested
+  // array comes back as something that indexes and has .length but is not an
+  // Array to the JS engine. Asking isArray silently took the one-profile
+  // branch and every merged row drew a single initial. Duck-type instead.
+  var names = (row && row.profileNames && typeof row.profileNames.length === "number")
+    ? row.profileNames
     : (row && row.profileName) ? [row.profileName] : []
   var out = ""
   for (var i = 0; i < names.length; i++) {
