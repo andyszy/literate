@@ -426,7 +426,12 @@ Item {
   // it earns most of the screen, capped so it doesn't look absurd on an
   // ultrawide monitor.
   property int triageCardWidth: Math.min(panel.width - Style.gapsOut * 4, Style.space(1200))
-  property int triageCardHeight: panel.height - Style.gapsOut * 4
+  // A FIXED height rather than one that grows with the results: the card is a
+  // search surface, and a box that changes size on every keystroke is
+  // unsettling to type into. Near-full-height looked absurd holding three rows,
+  // so take a steady ~70% of the screen and let the list scroll inside it.
+  property int triageCardHeight: Math.min(
+    Math.round(panel.height * 0.7), panel.height - Style.gapsOut * 4)
   property int cardWidth: root.triageMode ? root.triageCardWidth : root.workspaceCardWidth
   property int cardHeight: root.triageMode ? root.triageCardHeight : root.workspaceCardHeight
 
