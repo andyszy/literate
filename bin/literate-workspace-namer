@@ -265,28 +265,30 @@ Rules
 - Names: 1-3 words, at most {max_name_chars} characters, no trailing punctuation, no quotes. Every workspace gets a different name.
 - Icon: the Phosphor icon name that best fits the subject, such as {" ".join(ICON_HINTS.split())}. Any Phosphor icon is allowed. Plain names only, no -fill or -bold variants.
 
-Examples
+Examples -- lettered, not numbered. Numbering these 1-5 collided with
+the real workspace ids in the question below: a small model asked about
+workspace 4 would answer with example D's windows verbatim.
 
-Workspace 1:
+Workspace A:
   - [google-chrome] Inbox (1,432) - andy@gmail.com - Gmail
-Workspace 2:
+Workspace B:
   - [google-chrome] Flights from LIS to LHR | Google Flights
   - [google-chrome] Lisbon hotels - Booking.com
-Workspace 3:
+Workspace C:
   - [foot] nvim ~/src/billing/invoice.rb
   - [foot] andy@mac:~/src/billing
-Workspace 4:
+Workspace D:
   - [Slack] #eng-platform - Acme
   - [google-chrome] RFC: auth token rotation - Google Docs
-Workspace 5 (previous: "email"):
+Workspace E (previous: "email"):
   - [google-chrome] Re: Q3 invoice - andy@gmail.com - Gmail
 
 {{"workspaces": [
-  {{"id": "1", "name": "email", "icon": "envelope"}},
-  {{"id": "2", "name": "lisbon trip", "icon": "airplane"}},
-  {{"id": "3", "name": "billing", "icon": "receipt"}},
-  {{"id": "4", "name": "auth token rfc", "icon": "key"}},
-  {{"id": "5", "name": "email", "icon": "envelope"}}
+  {{"id": "A", "name": "email", "icon": "envelope"}},
+  {{"id": "B", "name": "lisbon trip", "icon": "airplane"}},
+  {{"id": "C", "name": "billing", "icon": "receipt"}},
+  {{"id": "D", "name": "auth token rfc", "icon": "key"}},
+  {{"id": "E", "name": "email", "icon": "envelope"}}
 ]}}"""
 
 
