@@ -121,9 +121,18 @@ function searchUrl(query, template) {
   return t.replace("{searchTerms}", encodeURIComponent(String(query || "")))
 }
 
+// With nothing typed there is still one thing an address bar has to be able
+// to do, now that no keybind opens a browser any more: give you a window.
+// Deliberately the same shape as the other two actions, so the pinned row has
+// one renderer and one activation path rather than a special case.
+function newWindowAction() {
+  return { kind: "window", url: "", engine: "Browser",
+           label: "Open a new browser window" }
+}
+
 // The one row that is always available with something typed: open it if it is
 // a place, search for it if it is not. null only for an empty query, where
-// there is nothing to act on and the shelf itself is the answer.
+// the caller falls back to newWindowAction().
 function urlOrSearch(query, search) {
   var q = String(query || "").replace(/^\s+|\s+$/g, "")
   if (!q) return null
