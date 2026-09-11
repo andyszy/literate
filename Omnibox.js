@@ -83,6 +83,58 @@ function compareHistory(a, b) {
   return (Number(b.item.lastVisit) || 0) - (Number(a.item.lastVisit) || 0)
 }
 
+// ------------------------------------------------------- the typed query
+//
+// With Chrome's own address bar gone, the text someone typed is itself an
+// answer and there must never be a state where Enter does nothing with it.
+// These three functions are that answer, and they live here rather than in
+// Shelf.qml so the rules are testable without a compositor.
+
+// "" when the query is not a location, otherwise the URL to open. A location
+// is a scheme we can hand to a browser, a host with a port (localhost:3000),
+// an IP, or a bare domain whose last label looks like a TLD -- that last check
+// is what keeps "3.5" and a version number out.
+function looksLikeUrl(query) {
+  var q = String(query || "").replace(/^\s+|\s+$/g, "")
+  if (!q || /\s/.test(q)) return ""
+  if (/^[a-z][a-z0-9+.\-]*:\/\//i.test(q)) return q
+  // A loopback or .local name: https would fail on almost every dev server,
+  // and http on localhost is not a downgrade anybody can intercept.
+  if (/^(localhost|127(\.\d{1,3}){3}|\[::1\])(:\d+)?(\/.*)?$/i.test(q)
+      || /^[a-z0-9\-]+\.local(host)?(:\d+)?(\/.*)?$/i.test(q))
+    return "http://" + q
+  if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?(\/.*)?$/.test(q)) return "http://" + q
+  // host:port, and the bare domain case. Both go to https: a browser that
+  // wants http will be told so by the redirect.
+  if (/^[a-z0-9][a-z0-9\-]*(\.[a-z0-9\-]+)*:\d+(\/.*)?$/i.test(q)) return "https://" + q
+  if (/^[a-z0-9][a-z0-9\-]*(\.[a-z0-9\-]+)*\.[a-z]{2,}(:\d+)?([\/?#].*)?$/i.test(q))
+    return "https://" + q
+  return ""
+}
+
+// The user's OWN search engine, which arrives in the index because the daemon
+// reads it out of Chrome's Preferences (see chrome_search_engine()). Google is
+// the fallback for a missing or unreadable index, never an override.
+function searchUrl(query, template) {
+  var t = String(template || "")
+  if (t.indexOf("{searchTerms}") < 0) t = "https://www.google.com/search?q={searchTerms}"
+  return t.replace("{searchTerms}", encodeURIComponent(String(query || "")))
+}
+
+// The one row that is always available with something typed: open it if it is
+// a place, search for it if it is not. null only for an empty query, where
+// there is nothing to act on and the shelf itself is the answer.
+function urlOrSearch(query, search) {
+  var q = String(query || "").replace(/^\s+|\s+$/g, "")
+  if (!q) return null
+  var url = looksLikeUrl(q)
+  if (url)
+    return { kind: "open", url: url, engine: "Open", label: "Open " + url }
+  return { kind: "search", url: searchUrl(q, search && search.template),
+           engine: (search && search.name) ? String(search.name) : "Google",
+           label: "Search the web for “" + q + "”" }
+}
+
 // Mirrors bin/literate-workspace-namer's strip_status_glyphs(): drop leading
 // whitespace and symbol/spinner characters so a live Claude Code window title
 // (which carries a status glyph while the agent is working) compares equal to

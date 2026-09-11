@@ -110,6 +110,80 @@ class TestHistoryRanking(OmniboxJsTest):
         self.assertEqual(len(hits), 1)
 
 
+GOOGLE = {"name": "Google", "template": "https://www.google.com/search?q={searchTerms}"}
+
+
+class TestUrlVersusSearch(OmniboxJsTest):
+    """The rule the pinned row lives by: is this text a place or a question?
+    With no address bar left, getting it wrong means either a search for
+    "localhost:3000" or a navigation to "3.5"."""
+
+    def action(self, query, search=GOOGLE):
+        return self.call("urlOrSearch(query, search)", query=query, search=search)
+
+    def test_a_bare_domain_with_a_path_is_a_place(self):
+        self.assertEqual(self.action("github.com/foo"),
+                         {"kind": "open", "url": "https://github.com/foo",
+                          "engine": "Open", "label": "Open https://github.com/foo"})
+
+    def test_a_host_with_a_port_is_a_place_and_localhost_is_not_https(self):
+        # https://localhost:3000 fails on essentially every dev server, and
+        # http to loopback is not a downgrade anyone can intercept.
+        self.assertEqual(self.action("localhost:3000")["url"], "http://localhost:3000")
+        self.assertEqual(self.action("127.0.0.1:8080")["url"], "http://127.0.0.1:8080")
+        self.assertEqual(self.action("mini.local:5900")["url"], "http://mini.local:5900")
+
+    def test_an_explicit_scheme_is_passed_through_untouched(self):
+        for url in ("https://x.dev/a?b=1", "http://x.dev", "file:///tmp/x.html"):
+            self.assertEqual(self.action(url)["url"], url)
+
+    def test_words_and_version_numbers_are_searches(self):
+        for query in ("gm", "hello world", "3.5", "u.s.", "why is the sky blue"):
+            self.assertEqual(self.action(query)["kind"], "search", query)
+
+    def test_a_search_goes_through_the_users_own_engine(self):
+        ddg = {"name": "DuckDuckGo", "template": "https://duckduckgo.com/?q={searchTerms}"}
+        action = self.action("hello world", ddg)
+        self.assertEqual(action["url"], "https://duckduckgo.com/?q=hello%20world")
+        self.assertEqual(action["engine"], "DuckDuckGo")
+
+    def test_google_is_the_fallback_and_only_the_fallback(self):
+        # A missing or unreadable index must still leave Enter working.
+        self.assertEqual(self.action("hello", None)["url"],
+                         "https://www.google.com/search?q=hello")
+        self.assertEqual(self.action("hello", {"name": "", "template": "nonsense"})["url"],
+                         "https://www.google.com/search?q=hello")
+
+    def test_an_empty_query_has_no_action_at_all(self):
+        self.assertIsNone(self.action(""))
+        self.assertIsNone(self.action("   "))
+
+
+class TestSearchEngineFromChrome(unittest.TestCase):
+    """The daemon half: what the index ships as the search engine."""
+
+    def test_chromes_own_google_template_is_reduced_to_a_usable_one(self):
+        raw = ("{google:baseURL}search?q={searchTerms}&{google:RLZ}"
+               "{google:originalQueryForSuggestion}ie={inputEncoding}")
+        self.assertEqual(namer.clean_search_template(raw),
+                         "https://www.google.com/search?q={searchTerms}")
+
+    def test_a_plain_third_party_template_survives_intact(self):
+        self.assertEqual(namer.clean_search_template("https://duckduckgo.com/?q={searchTerms}"),
+                         "https://duckduckgo.com/?q={searchTerms}")
+
+    def test_a_template_that_cannot_be_honoured_is_refused(self):
+        # No search terms, an unexpandable host, or not a web URL at all: the
+        # caller falls back to Google rather than building a broken request.
+        for raw in ("https://example.com/?a=b", "{google:unknown}/search?q={searchTerms}",
+                    "chrome://history/?q={searchTerms}", ""):
+            self.assertEqual(namer.clean_search_template(raw), "", raw)
+
+    def test_no_chrome_preferences_still_yields_a_working_engine(self):
+        self.assertEqual(namer.chrome_search_engine("nonexistent-profile"),
+                         namer.GOOGLE_SEARCH)
+
+
 class TestIndexAndRankingAgree(unittest.TestCase):
     """The index and the ranking are one decision in two files."""
 

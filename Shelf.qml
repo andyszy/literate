@@ -79,11 +79,13 @@ Item {
   // workspace -- i.e. it would send you somewhere else entirely, silently.
   // Nothing below indexes wsTiles by this; tileFor() looks it up.
   property int selectedWorkspace: 0
-  // Which half of the surface Enter belongs to. Without this there is no
+  // Which part of the surface Enter belongs to. Without this there is no
   // answer to "the pointer is over board 3 and the panel's first row is a
   // window on board 1 -- what does Enter do?", and the answer it fell into
-  // was the wrong one.
-  property string focusRegion: "shelf"   // "shelf" | "panel"
+  // was the wrong one. "action" is the pinned row carrying the typed query
+  // itself (see queryAction); it is its own region because it is one row that
+  // never scrolls, not a place in the result list.
+  property string focusRegion: "shelf"   // "shelf" | "action" | "panel"
   property string query: ""
   property int cursor: 0
   property bool pointerLive: false
@@ -103,7 +105,9 @@ Item {
   function open(initialQuery) {
     root.selectedWorkspace = 0
     root.query = String(initialQuery || "")
-    root.focusRegion = root.query.length > 0 ? "panel" : "shelf"
+    var initial = Omnibox.urlOrSearch(root.query, root.searchEngine)
+    root.focusRegion = root.query.length === 0 ? "shelf"
+      : (initial && initial.kind === "open") ? "action" : "panel"
     root.cursor = 0
     root.pointerLive = false
     root.rebuild()
@@ -219,7 +223,13 @@ Item {
     // Tab from here narrows to one workspace deliberately.
     if (text.length > 0) {
       root.selectedWorkspace = 0
-      root.focusRegion = "panel"
+      // A query that is already a location is not a search for anything: the
+      // pinned row IS the answer, so Enter goes straight there without an
+      // arrow key. Anything else lands on the best result, exactly as an
+      // address bar highlights its top suggestion and leaves "search for what
+      // I typed" one keystroke away.
+      var action = Omnibox.urlOrSearch(text, root.searchEngine)
+      root.focusRegion = (action && action.kind === "open") ? "action" : "panel"
     } else {
       root.focusRegion = "shelf"
     }
@@ -457,6 +467,32 @@ Item {
   readonly property int tierLimit: 6
   readonly property var rows: root.computeRows()
 
+  // ------------------------------------------------------- the typed query
+  //
+  // With Chrome's address bar gone there must never be a state where Enter
+  // does nothing useful with what was typed, so this row exists for every
+  // non-empty query: "Open <url>" when the query is a location, "Search the
+  // web for <query>" when it is not (through the user's OWN search engine,
+  // which the daemon reads out of Chrome's Preferences).
+  //
+  // It is PINNED directly under the query line rather than sorted into the
+  // result list, and it is its own focus region. That is the whole point: a
+  // last row can be forty rows down a scrolling list, and a first row would
+  // mean typing "gm" and pressing Enter searched the web instead of opening
+  // gmail.com. Pinned, it is always on screen, always one key from the
+  // cursor's home, and Enter still belongs to the best result -- which is
+  // exactly where Chrome puts its own default suggestion.
+  readonly property var queryAction: Omnibox.urlOrSearch(root.query, root.searchEngine)
+  // A query with no matches at all leaves the panel region pointing at
+  // nothing, and Enter doing nothing is precisely the state this piece exists
+  // to abolish. So an empty result list hands the region to the pinned row
+  // rather than to the void. Everything that draws or dispatches reads this,
+  // never focusRegion directly.
+  readonly property string activeRegion: (root.focusRegion === "panel"
+    && root.selectableRows.length === 0 && root.queryAction) ? "action" : root.focusRegion
+  readonly property var searchEngine: (root.omniboxIndex && root.omniboxIndex.search)
+    ? root.omniboxIndex.search : null
+
   function windowsForTile() {
     var out = []
     for (var i = 0; i < root.wsTiles.length; i++) {
@@ -601,16 +637,33 @@ Item {
   function select(delta) {
     var n = root.selectableRows.length
     root.pointerLive = false
+    // Down out of the boards lands on the pinned query row if there is one,
+    // then in the list; up retraces the same three steps. One continuous
+    // column to the arrow keys, with Enter changing meaning at each boundary.
     if (root.focusRegion === "shelf") {
-      if (delta > 0 && n > 0) {
+      if (delta <= 0) return
+      if (root.queryAction) { root.focusRegion = "action"; return }
+      if (n > 0) {
         root.focusRegion = "panel"
         root.cursor = 0
         listView.positionViewAtIndex(root.selectableRows[0], ListView.Contain)
       }
       return
     }
-    if (n === 0) { root.focusRegion = "shelf"; return }
-    if (delta < 0 && root.cursor === 0) { root.focusRegion = "shelf"; return }
+    if (root.focusRegion === "action") {
+      if (delta < 0) { root.focusRegion = "shelf"; return }
+      if (n > 0) {
+        root.focusRegion = "panel"
+        root.cursor = 0
+        listView.positionViewAtIndex(root.selectableRows[0], ListView.Contain)
+      }
+      return
+    }
+    if (n === 0) { root.focusRegion = root.queryAction ? "action" : "shelf"; return }
+    if (delta < 0 && root.cursor === 0) {
+      root.focusRegion = root.queryAction ? "action" : "shelf"
+      return
+    }
     root.cursor = (root.cursor + delta + n) % n
     listView.positionViewAtIndex(root.selectableRows[root.cursor], ListView.Contain)
   }
@@ -664,11 +717,15 @@ Item {
     launchProc.running = true
   }
 
-  function openHistoryEntry(hist) {
-    if (!hist || !hist.url) return
-    var cmd = "omarchy launch browser " + Util.shellQuote(hist.url)
+  function openUrl(url) {
+    if (!url) return
+    var cmd = "omarchy launch browser " + Util.shellQuote(url)
     launchProc.command = ["hyprctl", "dispatch", root.execCmdDispatch(cmd)]
     launchProc.running = true
+  }
+
+  function openHistoryEntry(hist) {
+    if (hist && hist.url) root.openUrl(hist.url)
   }
 
   // Enter on a board goes to that workspace; Enter on a row acts on the row.
@@ -677,8 +734,15 @@ Item {
   // used to ask and is why hovering board 3 and pressing Enter landed on
   // workspace 1.
   function activateCurrent() {
-    if (root.focusRegion === "shelf") {
+    if (root.activeRegion === "shelf") {
       if (root.selectedWorkspace > 0) root.gotoWorkspace(root.selectedWorkspace)
+      return
+    }
+    if (root.activeRegion === "action") {
+      if (root.queryAction) {
+        root.openUrl(root.queryAction.url)
+        root.closeRequested()
+      }
       return
     }
     var row = root.currentRow()
@@ -932,17 +996,6 @@ Item {
 
   // ------------------------------------------------------ launcher actions
 
-  function looksLikeUrl(q) {
-    if (/^[a-z][a-z0-9+.\-]*:\/\//i.test(q)) return q
-    if (!/\s/.test(q) && /^[a-z0-9][a-z0-9\-]*(\.[a-z0-9\-]+)+(\/.*)?$/i.test(q))
-      return "https://" + q
-    return ""
-  }
-
-  function searchUrl(q) {
-    return "https://www.google.com/search?q=" + encodeURIComponent(q)
-  }
-
   // Pre-filled but NOT executed: running arbitrary typed text as a shell
   // command straight out of a search box is a foot-gun. The line is put into
   // readline's buffer with the terminal's own Device Status Report reply
@@ -1005,9 +1058,11 @@ Item {
     }
   }
 
+  // The browser chord and the pinned query row are the same decision, so they
+  // go through the same rules (Omnibox.urlOrSearch) rather than two copies.
   function launchBrowser(query) {
-    var url = root.looksLikeUrl(query)
-    root.openHistoryEntry({ url: url ? url : root.searchUrl(query) })
+    var action = Omnibox.urlOrSearch(query, root.searchEngine)
+    if (action) root.openUrl(action.url)
   }
 
   function launchAgent(query) {
@@ -1666,9 +1721,98 @@ Item {
         }
       }
 
+      // The pinned query action. Always present with something typed, always
+      // on screen, never scrolled: with no address bar left, "do what I typed"
+      // cannot be a row you have to go looking for.
+      Item {
+        id: actionRow
+        anchors { top: queryBar.bottom; left: parent.left; right: parent.right }
+        height: root.queryAction ? root.rowHeight : 0
+        visible: height > 0
+
+        readonly property bool hasCursor: root.activeRegion === "action"
+        readonly property color fg: actionRow.hasCursor ? root.selectedText : root.panelText
+
+        Rectangle {
+          anchors.fill: parent
+          anchors.leftMargin: Style.space(5)
+          anchors.rightMargin: Style.space(5)
+          visible: actionRow.hasCursor
+          radius: Math.max(Style.space(5), Style.cornerRadius)
+          color: root.selectedBackground
+        }
+
+        Item {
+          anchors.fill: parent
+          anchors.leftMargin: root.panelPadding + Style.space(5)
+          anchors.rightMargin: root.panelPadding + Style.space(5)
+
+          Text {
+            id: actionIcon
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.space(16)
+            text: root.glyph(root.queryAction && root.queryAction.kind === "open"
+              ? "arrow-up-right" : "magnifying-glass")
+            color: root.accent
+            font.family: phosphor.font.family
+            font.pixelSize: Style.font.body
+          }
+
+          Text {
+            id: actionKind
+            anchors.left: actionIcon.right
+            anchors.leftMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.space(92)
+            textFormat: Text.PlainText
+            // "Open", or the name of the engine this will actually use --
+            // read from Chrome, so a switch to DuckDuckGo shows up here.
+            text: root.queryAction ? root.queryAction.engine : ""
+            color: Util.alpha(actionRow.fg, 0.8)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            elide: Text.ElideRight
+          }
+
+          Text {
+            anchors.left: actionKind.right
+            anchors.leftMargin: Style.space(10)
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: root.queryAction ? root.queryAction.label : ""
+            color: actionRow.fg
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+        }
+
+        MouseArea {
+          id: actionMouse
+          anchors.fill: parent
+          enabled: actionRow.visible
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onEntered: if (root.pointerLive) root.focusRegion = "action"
+          onPositionChanged: function(mouse) {
+            if (!root.pointerMoved(actionMouse, mouse)) return
+            root.pointerLive = true
+            root.focusRegion = "action"
+          }
+          onClicked: {
+            root.pointerLive = true
+            root.focusRegion = "action"
+            root.activateCurrent()
+          }
+        }
+      }
+
       Text {
         visible: root.rows.length === 0
-        anchors { top: queryBar.bottom; left: parent.left; right: parent.right }
+        anchors { top: actionRow.bottom; left: parent.left; right: parent.right }
         anchors.leftMargin: root.panelPadding
         anchors.rightMargin: root.panelPadding
         anchors.topMargin: Style.spacing.md
@@ -1683,7 +1827,7 @@ Item {
 
       ListView {
         id: listView
-        anchors { top: queryBar.bottom; left: parent.left; right: parent.right
+        anchors { top: actionRow.bottom; left: parent.left; right: parent.right
                   bottom: footer.top }
         anchors.topMargin: Style.spacing.sm
         anchors.leftMargin: Style.space(5)
@@ -1887,9 +2031,12 @@ Item {
           verticalAlignment: Text.AlignVCenter
           textFormat: Text.PlainText
           text: {
-            var hint = "⇥ workspace    ↑↓ item    ⏎ " + (root.focusRegion === "shelf"
+            var hint = "⇥ workspace    ↑↓ item    ⏎ " + (root.activeRegion === "shelf"
               ? (root.selectedWorkspace > 0 ? "go to workspace " + root.selectedWorkspace
                                             : "type to search")
+              : root.activeRegion === "action"
+              ? (root.queryAction && root.queryAction.kind === "open" ? "open it"
+                                                                      : "search the web")
               : "focus / resume / open")
             if (root.query.length > 0) {
               // Only meaningful with something typed, and only for the chords
