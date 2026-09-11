@@ -15,7 +15,8 @@ an icon. Results land in a JSON file the bar widget watches.
   literate-workspace-namer --once          one pass over the live desktop
   literate-workspace-namer --test FIXTURE  name a fixture; print, write nothing
   literate-workspace-namer --suggest ID    one workspace, one model call; print JSON, write nothing
-  literate-workspace-namer --triage        every window, every workspace, one model call, grouped by activity
+  literate-workspace-namer --triage        every window, every workspace, grouped by activity (cached by the daemon)
+  literate-workspace-namer --triage --no-cache   ...ignoring the daemon's cache; always ask the model
   literate-workspace-namer --pin ID NAME [ICON]  fix a workspace's name; the model skips it
   literate-workspace-namer --unpin ID            drop a pin; back to model-named
 """
@@ -860,18 +861,35 @@ class Namer:
 
     # ---------------------------------------------------------------- triage
 
-    def triage(self):
-        """Every window on every real workspace, one model call, grouped by
-        what the person is doing rather than which app is open. Still asks the
-        model every time; reading the daemon's cache is the next commit.
-        Returns (payload, exit_code)."""
+    def triage(self, use_cache=True):
+        """Every window on every real workspace, grouped by what the person is
+        doing rather than which app is open. Returns (payload, exit_code).
+
+        The daemon precomputes this after every settled naming pass, so the
+        common case is a file read and no model call at all. A miss -- no
+        cache, a window set that has moved on, or precompute switched off --
+        falls back to asking the model live, exactly as this always did.
+        `cached` in the payload says which happened."""
         try:
             windows = self.triage_windows(list(self._filtered_clients()))
         except Exception as e:
             return {"error": f"hyprctl failed: {e}"[:200]}, 1
         if not windows:
-            return {"categories": [], "windows": []}, 0
-        return self.compute_triage(windows)
+            return {"categories": [], "windows": [], "cached": False}, 0
+
+        signature = self.triage_signature(windows)
+        if use_cache:
+            hit = self.read_triage_cache(signature)
+            if hit is not None:
+                return {**hit, "cached": True}, 0
+
+        payload, code = self.compute_triage(windows)
+        if code == 0 and use_cache:
+            # A live miss still warms the cache: the next press is instant
+            # even if the daemon is not running at all.
+            self.write_triage_cache(signature, payload)
+        payload["cached"] = False
+        return payload, code
 
     def compute_triage(self, windows):
         """The model call and all the validation behind it. Shared verbatim by
@@ -1148,7 +1166,7 @@ if __name__ == "__main__":
         sys.exit(code)
     elif "--triage" in sys.argv:
         try:
-            payload, code = namer.triage()
+            payload, code = namer.triage(use_cache="--no-cache" not in sys.argv)
         except Exception as e:  # a bug here must still exit clean, never a traceback
             payload, code = {"error": str(e)[:200]}, 1
         print(json.dumps(payload, separators=(",", ":")))
