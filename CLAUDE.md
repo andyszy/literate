@@ -498,6 +498,20 @@ to be -- holding its own `History` and `Favicons`. Anything that hardcodes
 - `chrome_profiles` (config) restricts the set by directory name. Empty means
   all of them. It is the answer to "don't put my work history in my personal
   search box", one step short of `omnibox_index: false`.
+
+Favicons follow the same rule. `~/.config/google-chrome/<profile>/Favicons`
+joins `icon_mapping` (page URL -> icon) to `favicon_bitmaps` (the PNG), read
+with the same `immutable=1` open, and a row takes **its own profile's icon
+first**: the same site signed into twice can hold a different icon each side,
+and the row belongs to one of them. Another profile's icon is the fallback,
+because it still beats a blank square.
+
+The images cannot stay in sqlite -- no QML `Image` can open that -- so the
+indexer unpacks the ones it references into `~/.local/state/literate/favicons/`
+and puts the path in the row. Files are named by the hash of their contents, so
+the hundreds of pages sharing one site's icon share one file (2000 rows came to
+83 files, 332 KB here), and anything the current index no longer references is
+deleted on the next build. The directory tracks the index instead of growing.
 - Both sources are capped (`OMNIBOX_CONV_LIMIT`, `OMNIBOX_HISTORY_LIMIT`) so
   the JSON stays small enough for a UI to hold in memory and filter locally.
 - The daemon also rebuilds the index opportunistically, the same shape as
