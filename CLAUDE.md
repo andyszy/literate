@@ -320,6 +320,40 @@ model; it must not end up inside the subject a person reads. Note also that
 resolves, since the tab's branding is already in the window title, but the
 URL-derived field is the privacy-sensitive one and follows the setting.
 
+## `lastFocus`: the datum Hyprland does not keep
+
+Hyprland exposes no per-window last-focus time, and nothing else on the
+machine does either -- joining against Chrome history to answer "when did I
+last touch this" lies, because a window open right now can sit behind a
+six-day-old visit row. The daemon is already on the event socket, so it
+records focus itself.
+
+- The event is **`activewindowv2`**, payload a bare window address with no
+  `0x` prefix (`activewindowv2>>aaaaf6e5f8c0`) -- `hyprctl` spells the same
+  address `0xaaaaf6e5f8c0`, so everything goes through `normalize_address()`.
+  An empty payload means focus left everything and is ignored.
+- It is deliberately **not** in the listener's `watched` tuple. Which window
+  has focus is not a change to the window *set*; adding it there would cost a
+  naming pass, and eventually a model call, on every alt-tab.
+- Writes are coalesced (`FOCUS_FLUSH_INTERVAL`), because focus changes arrive
+  as fast as someone can hold Alt. `focus.json` is only ever interesting to a
+  UI that is about to open.
+- Pruning is twofold: `closewindow` carries the address, so `forget_focus()`
+  is exact and free; `prune_focus()` then sweeps whatever closed while the
+  daemon was down, against the **unfiltered** address set `_filtered_clients()`
+  collects on its way past (filtering it would forget every scratchpad window
+  once a pass).
+- `lastFocus` is **not** part of `triage_signature()`, or alt-tabbing would
+  throw away the precomputed grouping. That does mean a cache hit carries a
+  stale timestamp, so `triage()` re-stamps from the live map on the way out.
+- A window the daemon has never watched take focus reports **null**. Not the
+  window's age, not "now" -- the one column that exists to be trusted must not
+  contain a confident guess. The single exception is `seed_focus()`, which
+  stamps the window that is focused when the daemon connects: nothing replays
+  the focus we missed, and "this window is focused at this instant" is an
+  observation rather than a guess. It only ever applies to an address with no
+  record, so a restart cannot overwrite a real earlier timestamp.
+
 ## The triage view
 
 `Triage.qml` is the SUPER+0 full-desktop overview: every window on every
