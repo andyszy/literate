@@ -494,6 +494,419 @@ def chrome_url_suffix(title, window, mode, max_chars):
     return (" " + " ".join(parts)) if parts else ""
 
 
+# ------------------------------------------------------------- app identity
+#
+# Hyprland hands out a window *class*, which is a machine string:
+# "chrome-gmail.com__-Default", "google-chrome", "org.omarchy.claude". Left
+# alone it reaches the UI verbatim and reads like a filename. Resolving it to
+# something a person would say happens in a fixed order, each layer only
+# running because the one above it had nothing:
+#
+#   1. the desktop entry that declares this class (StartupWMClass, then the
+#      .desktop filename stem) -- the system's own answer, so it wins;
+#   2. a Chrome site-app class, unwrapped to its host and named through
+#      KNOWN_HOSTS;
+#   3. a bare browser window, which is not an app identity at all -- named
+#      after the site in its active tab instead (see chrome-tabs.json above);
+#   4. reverse-DNS prettification, so nothing machine-shaped ever escapes.
+#
+# Browser classes take (3) before (1) on purpose: "Google Chrome" is a true
+# desktop-entry answer and a useless one -- nobody's window is "Chrome", it
+# is the page they are reading. The desktop entry stays the fallback for a
+# browser window we could not join to a tab.
+
+DESKTOP_DIRS = (Path("/usr/share/applications"),
+                HOME / ".local/share/applications")
+
+
+def parse_desktop_entry(path):
+    """Name/Icon/StartupWMClass out of one .desktop file, or None.
+
+    Deliberately not configparser: desktop files are full of things it
+    rejects outright (duplicate keys, "Name[de]=" locale suffixes, %-escapes),
+    and a single malformed file must not take the whole index down with it.
+    Only the [Desktop Entry] group is read -- the [Desktop Action *] groups
+    below it carry their own Name=, which is a different app's worth of
+    wrong."""
+    name = icon = wmclass = ""
+    try:
+        in_entry = False
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    if in_entry:
+                        break  # past [Desktop Entry]; the action groups follow
+                    in_entry = line == "[Desktop Entry]"
+                    continue
+                if not in_entry or "=" not in line or line.startswith("#"):
+                    continue
+                key, value = line.split("=", 1)
+                key, value = key.strip(), value.strip()
+                if key == "Name" and not name:
+                    name = value
+                elif key == "Icon" and not icon:
+                    icon = value
+                elif key == "StartupWMClass" and not wmclass:
+                    wmclass = value
+    except OSError:
+        return None
+    return {"name": name, "icon": icon, "wmclass": wmclass} if name else None
+
+
+class DesktopIndex:
+    """Every .desktop file on the machine, keyed by the two things a window
+    class can match: the StartupWMClass it declares, and its own filename
+    stem. Built once and kept; rebuilt only when a directory's mtime moves,
+    which is what installing or removing an app does. A lookup therefore
+    costs one dict hit plus two stat() calls, not a directory walk."""
+
+    def __init__(self, dirs=DESKTOP_DIRS):
+        self.dirs = tuple(Path(d) for d in dirs)
+        self.by_wmclass = {}
+        self.by_stem = {}
+        self.stamps = None
+
+    def _stamps(self):
+        out = []
+        for d in self.dirs:
+            try:
+                out.append(d.stat().st_mtime_ns)
+            except OSError:
+                out.append(None)  # a missing dir is a state like any other
+        return tuple(out)
+
+    def refresh(self):
+        stamps = self._stamps()
+        if stamps == self.stamps:
+            return self
+        by_wmclass, by_stem = {}, {}
+        # System first, user second, so ~/.local/share/applications wins a
+        # collision -- that is the whole point of the user directory.
+        for d in self.dirs:
+            try:
+                paths = sorted(d.glob("*.desktop"))
+            except OSError:
+                continue
+            for p in paths:
+                entry = parse_desktop_entry(p)
+                if not entry:
+                    continue
+                by_stem[p.stem.lower()] = entry
+                if entry["wmclass"]:
+                    by_wmclass[entry["wmclass"].lower()] = entry
+        self.by_wmclass, self.by_stem, self.stamps = by_wmclass, by_stem, stamps
+        return self
+
+    def lookup(self, cls):
+        """StartupWMClass first: it is the field that exists precisely to say
+        "this window belongs to this app". The filename stem is the weaker
+        guess that happens to be right for most of the archive."""
+        key = (cls or "").strip().lower()
+        if not key:
+            return None
+        self.refresh()
+        return self.by_wmclass.get(key) or self.by_stem.get(key)
+
+
+DESKTOP_INDEX = DesktopIndex()
+
+
+# The one table of web hosts -> the name a person uses for that site. Both an
+# open window (a Chrome site-app class, or a bare browser window joined to its
+# active tab) and a row of Chrome history are labelled through site_name()
+# below, so "Gmail" the open window and "Gmail" the history hit can never
+# disagree. Add a host here and both sides learn it at once.
+KNOWN_HOSTS = {
+    "gmail.com": "Gmail",
+    "mail.google.com": "Gmail",
+    "inbox.google.com": "Gmail",
+    "calendar.google.com": "Google Calendar",
+    "docs.google.com": "Google Docs",
+    "sheets.google.com": "Google Sheets",
+    "slides.google.com": "Google Slides",
+    "drive.google.com": "Google Drive",
+    "meet.google.com": "Google Meet",
+    "chat.google.com": "Google Chat",
+    "contacts.google.com": "Google Contacts",
+    "photos.google.com": "Google Photos",
+    "messages.google.com": "Google Messages",
+    "maps.google.com": "Google Maps",
+    "groups.google.com": "Google Groups",
+    "google.com": "Google",
+    "github.com": "GitHub",
+    "gist.github.com": "GitHub Gist",
+    "support.github.com": "GitHub Support",
+    "gitlab.com": "GitLab",
+    "dev.azure.com": "Azure DevOps",
+    "portal.azure.com": "Azure",
+    "bitbucket.org": "Bitbucket",
+    "stackoverflow.com": "Stack Overflow",
+    "news.ycombinator.com": "Hacker News",
+    "reddit.com": "Reddit",
+    "linear.app": "Linear",
+    "notion.so": "Notion",
+    "figma.com": "Figma",
+    "app.slack.com": "Slack",
+    "slack.com": "Slack",
+    "discord.com": "Discord",
+    "web.whatsapp.com": "WhatsApp",
+    "teams.microsoft.com": "Microsoft Teams",
+    "outlook.office.com": "Outlook",
+    "outlook.live.com": "Outlook",
+    "basecamp.com": "Basecamp",
+    "hey.com": "HEY",
+    "app.hey.com": "HEY",
+    "zoom.us": "Zoom",
+    "youtube.com": "YouTube",
+    "x.com": "X",
+    "twitter.com": "X",
+    "linkedin.com": "LinkedIn",
+    "claude.ai": "Claude",
+    "claude.com": "Claude",
+    "chatgpt.com": "ChatGPT",
+    "console.anthropic.com": "Anthropic Console",
+    "docs.anthropic.com": "Anthropic Docs",
+    "amazon.com": "Amazon",
+    "aws.amazon.com": "AWS",
+    "console.aws.amazon.com": "AWS Console",
+    "stripe.com": "Stripe",
+    "dashboard.stripe.com": "Stripe",
+    "localhost": "Localhost",
+}
+
+# A window class that is reverse-DNS shaped but has no desktop entry to speak
+# for it, and whose last segment prettifies to the wrong thing. These are the
+# app-ids Omarchy invents for its terminal apps: "org.omarchy.claude" is a
+# Claude Code session, not an app called "Claude".
+REVERSE_DNS_NAMES = {
+    "org.omarchy.claude": "Claude Code",
+    "org.omarchy.terminal": "Terminal",
+    "org.omarchy.bash": "Terminal",
+    "org.omarchy.btop": "System Monitor",
+    "org.omarchy.about": "About Omarchy",
+    "org.omarchy.screensaver": "Screensaver",
+    "org.omarchy.tui": "Terminal",
+    "com.anthropic.claude": "Claude",
+}
+
+# Hosts whose last two labels are a public suffix, so the registrable name is
+# the third label back. Not a full public-suffix list -- just enough that
+# "bbc.co.uk" doesn't come out as "Co".
+MULTI_LABEL_TLDS = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "co.jp", "co.kr", "co.nz", "co.za",
+    "co.in", "com.au", "com.br", "com.mx", "com.cn", "com.tr", "net.au",
+}
+
+# "chrome-<host>__<path>-<Profile>" -- the class Chrome gives a site app.
+RE_PWA_CLASS = re.compile(r"^chrome-(?P<host>[^_\s/]+?)__(?P<rest>.*)$", re.I)
+# ...and the shape with no path at all, which some Chrome versions emit.
+RE_PWA_CLASS_BARE = re.compile(r"^chrome-(?P<host>[^_\s/]+?)-(?:Default|Profile[ _]?\d+)$", re.I)
+# The separators a GUI title uses between its parts, with surrounding space.
+RE_TITLE_SEP = re.compile(r"\s+[-–—|·•:]\s+")
+RE_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+RE_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# A trailing segment longer than this is prose, not a site's name for itself.
+BRANDING_TAIL_MAX = 40
+
+
+def registrable_label(host):
+    """The one label of a host that names the organisation: "github" for
+    support.github.com, "bbc" for www.bbc.co.uk."""
+    labels = [l for l in (host or "").split(".") if l]
+    if len(labels) >= 3 and ".".join(labels[-2:]) in MULTI_LABEL_TLDS:
+        return labels[-3]
+    if len(labels) >= 2:
+        return labels[-2]
+    return labels[0] if labels else ""
+
+
+def prettify_token(token):
+    """A machine token -> words. Separators become spaces and camelCase is
+    broken apart, then title_case_name() capitalises what is safe to touch
+    (it leaves acronyms and internal caps alone, so "macOS" survives)."""
+    spaced = RE_CAMEL.sub(" ", re.sub(r"[-_.]+", " ", token or ""))
+    return title_case_name(" ".join(spaced.split()))
+
+
+def site_name(host):
+    """The human name for a web host. Exact host, then the same host without
+    "www.", then each parent domain -- so docs.github.com reaches GitHub
+    without an entry of its own. Anything unknown falls back to the
+    registrable label, title-cased: never the bare hostname."""
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    if host in KNOWN_HOSTS:
+        return KNOWN_HOSTS[host]
+    if host.startswith("www."):
+        host = host[4:]
+        if host in KNOWN_HOSTS:
+            return KNOWN_HOSTS[host]
+    labels = host.split(".")
+    for i in range(1, len(labels) - 1):
+        parent = ".".join(labels[i:])
+        if parent in KNOWN_HOSTS:
+            return KNOWN_HOSTS[parent]
+    return prettify_token(registrable_label(host))
+
+
+def pwa_host(cls):
+    """The host inside a Chrome site-app class, or "". A class with no dot in
+    the host part isn't one of these, whatever else it may be."""
+    cls = (cls or "").strip()
+    for pattern in (RE_PWA_CLASS, RE_PWA_CLASS_BARE):
+        m = pattern.match(cls)
+        if m:
+            host = m.group("host")
+            if "." in host:
+                return host.lower()
+    return ""
+
+
+def reverse_dns_name(cls):
+    """Layer 4, the one that must always answer. A reverse-DNS app-id gives up
+    its last segment; anything else is prettified whole. The result is never
+    the raw class -- an unnamed window says "Foo Bar", not "org.foo.fooBar"."""
+    cls = (cls or "").strip()
+    if not cls:
+        return ""
+    known = REVERSE_DNS_NAMES.get(cls.lower())
+    if known:
+        return known
+    segments = [s for s in cls.split(".") if s]
+    token = segments[-1] if len(segments) >= 3 else cls
+    return prettify_token(token) or prettify_token(cls)
+
+
+def title_segments(title):
+    """(segments, offsets) for a title split on its separators. offsets[i] is
+    where the separator *after* segment i starts, so a caller that drops
+    trailing segments can slice the original string and keep every inner
+    separator exactly as the app wrote it."""
+    segments, offsets, last = [], [], 0
+    for m in RE_TITLE_SEP.finditer(title or ""):
+        segments.append((title[last:m.start()]))
+        offsets.append(m.start())
+        last = m.end()
+    segments.append((title or "")[last:])
+    return segments, offsets
+
+
+def _same_name(a, b):
+    """Loose equality for names: case and punctuation don't count."""
+    norm = lambda s: re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    a, b = norm(a), norm(b)
+    return bool(a) and a == b
+
+
+def _redundant_tail(segment, app, host):
+    """Is this trailing title segment saying something the app column already
+    says? Conservative on purpose: only the app's own name, the host, or an
+    account address. Anything else is subject matter and stays."""
+    segment = (segment or "").strip()
+    if not segment:
+        return True
+    if RE_EMAIL.match(segment):
+        return True
+    if _same_name(segment, app):
+        return True
+    if host and (_same_name(segment, host) or _same_name(segment, site_name(host))
+                 or _same_name(segment, registrable_label(host))):
+        return True
+    return False
+
+
+def branding_tail(title):
+    """The site's own name for itself, which browsers leave at the end of a
+    page title ("... #4731655 - GitHub Support"). Only a short trailing
+    segment counts; a long one is the sentence continuing."""
+    segments, _ = title_segments(title or "")
+    if len(segments) < 2:
+        return ""
+    tail = segments[-1].strip()
+    if not tail or len(tail) > BRANDING_TAIL_MAX or RE_EMAIL.match(tail):
+        return ""
+    if not any(c.isalpha() for c in tail):
+        return ""
+    return tail
+
+
+def split_title(title, app="", host=""):
+    """One run-on title -> (subject, context). The subject is what the window
+    is actually about; the context is the account or site that the title
+    repeated after it. Never strips everything: a title that is nothing but
+    its app name keeps that as its subject rather than going blank."""
+    title = strip_status_glyphs((title or "").strip()).strip()
+    segments, offsets = title_segments(title)
+    keep = len(segments)
+    dropped = []
+    while keep > 1 and _redundant_tail(segments[keep - 1], app, host):
+        dropped.insert(0, segments[keep - 1].strip())
+        keep -= 1
+    subject = (title[:offsets[keep - 1]] if keep < len(segments) else title).strip()
+    useful = [d for d in dropped if d and not _same_name(d, app)]
+    context = " · ".join(useful) or (host or "")
+    return subject, context
+
+
+def window_identity(cls, title, chrome_window=None, expose_host=True, desktop=None):
+    """The whole chain, for one window: which app this is, what the window is
+    about, and the account or site behind it. chrome_window is this window's
+    entry from chrome-tabs.json when the two could be matched (see
+    match_chrome_windows) -- the only way to learn a bare browser window's
+    site, since Chrome never puts the URL in the OS window title."""
+    desktop = DESKTOP_INDEX if desktop is None else desktop
+    cls = (cls or "").strip()
+    title = strip_status_glyphs((title or "").strip()).strip()
+    host = ""
+    icon = ""
+
+    if isinstance(chrome_window, dict):
+        tabs = chrome_window.get("tabs")
+        tabs = [t for t in tabs if isinstance(t, dict)] if isinstance(tabs, list) else []
+        active = next((t for t in tabs if t.get("active")), None)
+        if active is None:
+            active = next((t for t in tabs if t.get("title") == title), None)
+        if active is not None:
+            host = registrable_domain(active.get("url") or "").lower()
+
+    if cls.lower() in CHROME_CLASSES:
+        # Layer 3. The tab's own branding beats anything derived from the
+        # host, because it is what the site calls itself today; the host is
+        # the answer for a page whose title carries no branding at all.
+        app, source = branding_tail(title), "tab-title"
+        if not app:
+            app, source = site_name(host), "tab-host"
+        if not app:
+            entry = desktop.lookup(cls)
+            if entry:
+                app, icon, source = entry["name"], entry["icon"], "desktop"
+            else:
+                app, source = reverse_dns_name(cls), "class"
+    else:
+        entry = desktop.lookup(cls)  # layer 1
+        if entry:
+            app, icon, source = entry["name"], entry["icon"], "desktop"
+        else:
+            site = pwa_host(cls)  # layer 2
+            if site:
+                host = host or site
+                app, source = site_name(site), "pwa"
+            else:
+                app, source = reverse_dns_name(cls), "class"  # layer 4
+
+    subject, context = split_title(title, app, host if expose_host else "")
+    return {
+        "app": app,
+        "subject": subject,
+        "context": context,
+        "host": host if expose_host else "",
+        "appIcon": icon,
+        "appSource": source,
+    }
+
+
 # --------------------------------------------------------------- omnibox index
 #
 # Pure, model-free, and read-only against two on-disk sources: past Claude
@@ -643,6 +1056,10 @@ def build_history(limit=OMNIBOX_HISTORY_LIMIT):
             "title": title,
             "url": url,
             "domain": domain,
+            # The same site_name()/KNOWN_HOSTS pair an open window goes
+            # through, so a Gmail window and a Gmail history row are labelled
+            # "Gmail" by one code path and cannot drift apart.
+            "app": site_name(domain),
             "visits": visits or 0,
             "lastVisit": webkit_to_unix(last_visit) if last_visit else 0,
         })
@@ -697,11 +1114,16 @@ class Namer:
     # ---------------------------------------------------------------- snapshot
 
     def _filtered_clients(self):
-        """Yield (ws, class, title, address) for every window hyprctl reports,
-        after the filtering every caller needs: special/scratchpad workspaces
-        (negative ids) skipped, ignore_classes honoured, titles cleaned and
-        clamped. snapshot() and --suggest both build on this so the rules
-        can't drift apart between them.
+        """Yield (ws, class, title, address, identity) for every window hyprctl
+        reports, after the filtering every caller needs: special/scratchpad
+        workspaces (negative ids) skipped, ignore_classes honoured, titles
+        cleaned and clamped. snapshot() and --suggest both build on this so the
+        rules can't drift apart between them.
+
+        `identity` is window_identity()'s app/subject/context/host split, and
+        it is worked out *before* the Chrome URL suffix is folded in below --
+        the suffix exists for the model's benefit and would otherwise show up
+        inside the subject a person reads.
 
         Chrome windows also get a URL suffix folded into their title here
         (see chrome_url_suffix()), so every caller and the cache signature
@@ -719,12 +1141,33 @@ class Namer:
             title = clean_title((c.get("title") or "").strip())[: self.cfg["max_title_chars"]]
             raw.append([ws, cls, title, c.get("address", "")])
 
-        self._enrich_chrome_titles(raw)
+        matches = self._chrome_matches(raw)
+        mode = self.cfg.get("chrome_urls", "domain")
+        identities = [window_identity(entry[1], entry[2], matches.get(i),
+                                      expose_host=mode != "off")
+                      for i, entry in enumerate(raw)]
+        self._enrich_chrome_titles(raw, matches)
 
-        for entry in raw:
-            yield tuple(entry)
+        for entry, identity in zip(raw, identities):
+            yield (*entry, identity)
 
-    def _enrich_chrome_titles(self, raw):
+    @staticmethod
+    def _chrome_matches(raw):
+        """{index in raw: chrome-tabs.json window} for the browser windows the
+        extension's last report can be lined up with unambiguously. Split out
+        of _enrich_chrome_titles() because the app-name resolution needs the
+        same pairing even when chrome_urls is "off" and no title is enriched:
+        a bare browser window has no identity without its active tab."""
+        chrome_windows = load_chrome_tabs()
+        if not chrome_windows:
+            return {}
+        hypr_titles = [(i, entry[2]) for i, entry in enumerate(raw)
+                       if entry[1].lower() in CHROME_CLASSES]
+        if not hypr_titles:
+            return {}
+        return match_chrome_windows(hypr_titles, chrome_windows)
+
+    def _enrich_chrome_titles(self, raw, matches):
         """Mutate raw (list of [ws, cls, title, address]) in place, appending
         URL info to any Chrome window title that matches one reported by the
         literate-tabs extension. No-op if chrome_urls is "off" or no fresh
@@ -733,14 +1176,7 @@ class Namer:
         mode = self.cfg.get("chrome_urls", "domain")
         if mode not in ("domain", "full"):
             return
-        chrome_windows = load_chrome_tabs()
-        if not chrome_windows:
-            return
-        hypr_titles = [(i, entry[2]) for i, entry in enumerate(raw)
-                       if entry[1].lower() in CHROME_CLASSES]
-        if not hypr_titles:
-            return
-        for i, window in match_chrome_windows(hypr_titles, chrome_windows).items():
+        for i, window in matches.items():
             suffix = chrome_url_suffix(raw[i][2], window, mode, self.cfg["max_title_chars"])
             if suffix:
                 raw[i][2] = raw[i][2] + suffix
@@ -749,7 +1185,7 @@ class Namer:
     def group_by_workspace(clients):
         """workspace id -> list of (class, title), for real workspaces only."""
         by_ws = {}
-        for ws, cls, title, _addr in clients:
+        for ws, cls, title, _addr, _identity in clients:
             by_ws.setdefault(str(ws), []).append((cls, title))
         for wins in by_ws.values():
             wins.sort()
@@ -760,8 +1196,9 @@ class Namer:
         """The flat, indexed window list --triage groups and the triage cache
         stores. Split out from triage() so a pass can build it from the client
         list it already has, without a second hyprctl call."""
-        return [{"index": i, "address": addr, "class": cls, "title": title, "workspace": str(ws)}
-                for i, (ws, cls, title, addr) in enumerate(clients)]
+        return [{"index": i, "address": addr, "class": cls, "title": title,
+                 "workspace": str(ws), **identity}
+                for i, (ws, cls, title, addr, identity) in enumerate(clients)]
 
     def snapshot(self):
         return self.group_by_workspace(self._filtered_clients())
@@ -770,8 +1207,8 @@ class Namer:
         """Every (filtered) window on one workspace, in hyprctl's own order,
         keeping the address -- snapshot() throws that away since naming only
         needs class+title, but --suggest hands addresses back to the caller."""
-        return [{"address": addr, "class": cls, "title": title}
-                for ws, cls, title, addr in self._filtered_clients() if ws == ws_id]
+        return [{"address": addr, "class": cls, "title": title, **identity}
+                for ws, cls, title, addr, identity in self._filtered_clients() if ws == ws_id]
 
     @staticmethod
     def signature(windows):

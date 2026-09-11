@@ -268,6 +268,58 @@ the next re-vendor deletes it silently.
   (not a "Thinking…" row) with the suggested name once the call lands or
   fails or hits its ~10s timeout.
 
+## Window classes are not app names
+
+Hyprland hands out a window *class* and nothing else. Left alone it reaches
+the UI verbatim, and the UI then shows people `chrome-gmail.com__-Default`.
+`window_identity()` resolves it, in a fixed order, each layer running only
+because the one above it had nothing:
+
+1. **the desktop entry** that claims the class -- `StartupWMClass` first (the
+   field that exists to say exactly this), then the `.desktop` filename stem.
+   `DesktopIndex` walks `/usr/share/applications` and
+   `~/.local/share/applications` once and rebuilds only when a directory's
+   mtime moves, so a lookup is a dict hit plus two `stat()`s. The parser is
+   hand-rolled on purpose: `configparser` rejects real desktop files
+   (duplicate keys, `Name[de]=`), and only the `[Desktop Entry]` group is
+   read -- the `[Desktop Action *]` groups below it carry their own `Name=`.
+2. **a Chrome site-app class**, `chrome-<host>__<path>-<Profile>`, unwrapped
+   to its host and named through `KNOWN_HOSTS`.
+3. **a bare browser window**, which is not an app identity at all. Browser
+   classes take this *before* the desktop entry: "Google Chrome" is a true
+   answer and a useless one -- nobody's window is Chrome, it is the page they
+   are reading. The active tab comes from the same `chrome-tabs.json` join the
+   model prompt uses, and its site's own branding (the short trailing title
+   segment) beats anything derived from the host. The desktop entry stays the
+   fallback for a browser window that could not be joined.
+4. **reverse-DNS prettification** -- last segment of `org.foo.Bar`, title-cased.
+   `REVERSE_DNS_NAMES` overrides the handful that prettify wrong, which is how
+   `org.omarchy.claude` becomes "Claude Code" rather than "Claude". Nothing
+   machine-shaped ever escapes this layer.
+
+`KNOWN_HOSTS`/`site_name()` is **one** table, deliberately shared with the
+omnibox index's Chrome history rows (`build_history()` sets each row's `app`
+through it). An open Gmail window and a Gmail history hit are labelled by one
+code path; teach it a host and both learn at once. Two tables would drift
+within a week.
+
+The run-on title is split at the same time into `app` / `subject` / `context`
+(plus `host`, `appIcon`, `appSource`), so a UI can lay out columns instead of
+rendering one string: `"Further your mission with GitHub 🚀 - andyszy@gmail.com
+- Gmail"` becomes subject `"Further your mission with GitHub 🚀"` and context
+`"andyszy@gmail.com"`. `split_title()` only ever strips *trailing* segments,
+and only ones it can prove redundant (the app's own name, the host, an email
+address), never down to nothing -- subject matter is never thrown away.
+`strip_status_glyphs()` still runs on the subject, because Claude Code writes
+a spinner into its title.
+
+Identity is computed in `_filtered_clients()` **before** `chrome_url_suffix()`
+folds the URL and other-tab list into the title. That suffix exists for the
+model; it must not end up inside the subject a person reads. Note also that
+`host` is suppressed when `chrome_urls` is `"off"` -- the app name still
+resolves, since the tab's branding is already in the window title, but the
+URL-derived field is the privacy-sensitive one and follows the setting.
+
 ## The triage view
 
 `Triage.qml` is the SUPER+0 full-desktop overview: every window on every
