@@ -70,8 +70,11 @@ FOCUS_PATH = STATE_DIR / "focus.json"
 FOCUS_FLUSH_INTERVAL = 5.0
 # Written by the literate-tabs Chrome extension's native-messaging host
 # (~/.config/omarchy/chrome-extensions/literate-tabs-host), not by this
-# daemon -- read-only from here.
-CHROME_TABS_PATH = STATE_DIR / "chrome-tabs.json"
+# daemon -- read-only from here. There is one file per *extension instance*,
+# which means one per signed-in Chrome profile: chrome-tabs.<instance>.json,
+# plus the shared chrome-tabs.json that hosts older than extension 1.1 write
+# between them. load_chrome_tabs() globs and merges the lot.
+CHROME_TABS_GLOB = "chrome-tabs*.json"
 # The extension only pushes on tab/window events, so a killed or disabled
 # extension leaves a file that otherwise looks fine forever. Time it out
 # ourselves rather than trust it indefinitely.
@@ -465,25 +468,62 @@ def triage_user_prompt(windows):
 # can't see URLs on its own. The literate-tabs extension (see
 # ~/.config/omarchy/chrome-extensions/literate-tabs) pushes each window's
 # tab list to a native-messaging host, which writes it here. This section
-# reads that file and lines its windows up with Hyprland's, by title -- the
-# only thing the two sides share -- so the model can be told more than the
-# active tab's bare title.
+# reads those files and lines their windows up with Hyprland's, by title --
+# the only thing the two sides share -- so the model can be told more than
+# the active tab's bare title.
+#
+# "Those files", plural: the extension is installed into every signed-in
+# Chrome profile and each copy connects its own host, so there is one report
+# per account and no single file can hold all of them without the profiles
+# taking turns erasing each other.
 
-def load_chrome_tabs(path=CHROME_TABS_PATH, max_age=CHROME_TABS_MAX_AGE, now=None):
-    """The extension's last-reported list of Chrome windows, or None if the
-    file is missing, unreadable, malformed, or older than max_age. Stale
-    data is worse than none: a window that has since closed or navigated
-    would otherwise go on "matching" forever."""
-    data = load_json(path, None)
-    if not isinstance(data, dict):
-        return None
-    updated = data.get("updatedAt")
-    if not isinstance(updated, (int, float)):
-        return None
-    if (now if now is not None else time.time()) - updated > max_age:
-        return None
-    windows = data.get("windows")
-    return windows if isinstance(windows, list) else None
+def load_chrome_tabs(state_dir=STATE_DIR, max_age=CHROME_TABS_MAX_AGE, now=None):
+    """Every fresh report from the literate-tabs extension, merged into one
+    list of Chrome windows -- or None when nothing fresh exists at all.
+
+    One file per extension instance, which is one per signed-in Chrome
+    profile, plus the shared file that hosts older than extension 1.1 write
+    between them. Reading only one of them is how a second profile's tabs
+    went missing; reading all of them is the whole fix.
+
+    Stale data is worse than none, because a window that has since closed or
+    navigated would otherwise go on "matching" forever -- so a report older
+    than max_age is dropped. Freshness is per *window* where the host records
+    it (falling back to the file's own updatedAt), so on the shared path one
+    profile's closed window ages out without taking the other profile's
+    windows with it. A window that appears in more than one file -- a host
+    that came back under a new instance id before its old file aged out --
+    is kept once, from the freshest report.
+    """
+    now = time.time() if now is None else now
+    by_id, unkeyed = {}, []
+    for path in sorted(Path(state_dir).glob(CHROME_TABS_GLOB)):
+        data = load_json(path, None)
+        if not isinstance(data, dict):
+            continue
+        file_seen = data.get("updatedAt")
+        if not isinstance(file_seen, (int, float)) or now - file_seen > max_age:
+            continue
+        instance = data.get("instanceId")
+        instance = instance if isinstance(instance, str) and instance else ""
+        for window in data.get("windows") or []:
+            if not isinstance(window, dict):
+                continue
+            seen = window.get("updatedAt")
+            seen = seen if isinstance(seen, (int, float)) else file_seen
+            if now - seen > max_age:
+                continue
+            # Copied, not mutated: these dicts are handed to the identity and
+            # prompt code, which has no business seeing bookkeeping fields
+            # change underneath it.
+            window = {**window, "updatedAt": seen, "instance": instance}
+            wid = window.get("id")
+            if wid is None:
+                unkeyed.append(window)
+            elif seen > (by_id[wid]["updatedAt"] if wid in by_id else -1):
+                by_id[wid] = window
+    windows = list(by_id.values()) + unkeyed
+    return windows or None
 
 
 def registrable_domain(url):
@@ -496,20 +536,52 @@ def registrable_domain(url):
         return ""
 
 
+def _tab_signature(window):
+    """Everything a caller of a matched window actually reads. Two reports
+    with the same signature are interchangeable."""
+    tabs = window.get("tabs")
+    tabs = [t for t in tabs if isinstance(t, dict)] if isinstance(tabs, list) else []
+    return [(t.get("title"), t.get("url"), bool(t.get("active"))) for t in tabs]
+
+
+def _pick_chrome_window(candidates):
+    """One reported window out of the candidates sharing a title, or None if
+    there is no way to tell which is meant.
+
+    With a second profile signed in, a title can now be reported twice for
+    reasons that have nothing to do with the person having two identical
+    windows open: the same doc open in both accounts, or a closed window on
+    the shared file that has not aged out yet. Prefer the freshest report --
+    a title still being re-pushed is the live one. Equally fresh and
+    genuinely different is the old ambiguous case, and stays unmatched.
+    """
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    freshest = max(w.get("updatedAt") or 0 for w in candidates)
+    tied = [w for w in candidates if (w.get("updatedAt") or 0) == freshest]
+    if len(tied) == 1:
+        return tied[0]
+    first = _tab_signature(tied[0])
+    if all(_tab_signature(w) == first for w in tied[1:]):
+        return tied[0]  # interchangeable: nothing the caller reads differs
+    return None
+
+
 def match_chrome_windows(hypr_titles, chrome_windows):
     """hypr_titles: [(index, title), ...] for this pass's Chrome-class
-    Hyprland windows. chrome_windows: the "windows" list from
-    chrome-tabs.json. Returns {index: chrome_window_dict} for the pairs that
-    match unambiguously.
+    Hyprland windows. chrome_windows: the merged window list from
+    load_chrome_tabs(). Returns {index: chrome_window_dict} for the pairs
+    that match unambiguously.
 
     Title is the only thing a Hyprland window and an extension-reported
     window share -- there is no window-handle correlation available -- so a
-    title that isn't unique on *either* side (two windows genuinely showing
-    the same active tab title, e.g. two blank "New Tab" windows) can't be
-    told apart and is left unmatched rather than guessed at.
+    title that isn't unique among Hyprland's windows (two windows genuinely
+    showing the same active tab title, e.g. two blank "New Tab" windows)
+    can't be told apart and is left unmatched rather than guessed at. Ties on
+    the *reported* side are now common enough to be worth resolving: see
+    _pick_chrome_window().
     """
     hypr_counts = Counter(title for _, title in hypr_titles)
-    chrome_counts = Counter()
     chrome_by_title = {}
     for w in chrome_windows:
         if not isinstance(w, dict):
@@ -517,12 +589,14 @@ def match_chrome_windows(hypr_titles, chrome_windows):
         title = w.get("activeTitle")
         if not isinstance(title, str):
             continue
-        chrome_counts[title] += 1
-        chrome_by_title[title] = w
+        chrome_by_title.setdefault(title, []).append(w)
     matches = {}
     for index, title in hypr_titles:
-        if hypr_counts[title] == 1 and chrome_counts.get(title) == 1:
-            matches[index] = chrome_by_title[title]
+        if hypr_counts[title] != 1:
+            continue
+        pick = _pick_chrome_window(chrome_by_title.get(title) or [])
+        if pick is not None:
+            matches[index] = pick
     return matches
 
 
