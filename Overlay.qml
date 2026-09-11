@@ -43,6 +43,11 @@ Item {
   // Triage.qml's header comment for why this lives here rather than as its
   // own manifest entry point.
   property bool triageMode: false
+  // The third lifecycle: Shelf.qml, the bar-continuous shelf of live
+  // workspace thumbnails over an omnibox panel ({"mode":"shelf"}). It owns
+  // its own top-anchored PanelWindow rather than drawing inside the centred
+  // card below, so this Item's panel stays hidden while it is up.
+  property bool shelfMode: false
   property string workspaceId: ""
   property int windowCount: -1
   // Fallback close-all target list, filled from `hyprctl -j clients` so the
@@ -85,6 +90,29 @@ Item {
     root.selectedIndex = 0
 
     root.triageMode = payload.mode === "triage"
+    root.shelfMode = payload.mode === "shelf"
+    if (root.shelfMode) {
+      root.workspaceId = ""
+      root.windowCount = -1
+      root.fallbackAddresses = []
+      root.suggestLoading = false
+      root.suggestFailed = false
+      root.suggestErrorText = ""
+      root.suggestedName = ""
+      root.suggestedIcon = ""
+      root.suggestedWindows = []
+      root.groups = []
+      shelfView.open(payload.query)
+      // Same reason as triage: SUPER+SHIFT+<n> is a global Hyprland bind the
+      // compositor would consume before a plain Wayland client ever sees it --
+      // and so are the user's own Terminal/Browser/agent chords, which the
+      // omnibox re-points at the typed query. The shelf defines its own submap
+      // at runtime (it depends on chords discovered from `hyprctl binds`), so
+      // it names the one to enter; "literate-triage" is the fallback, which
+      // still shadows the digits.
+      root.enterSubmap(shelfView.submapName || "literate-triage")
+      return
+    }
     if (root.triageMode) {
       root.workspaceId = ""
       root.windowCount = -1
@@ -135,6 +163,8 @@ Item {
     suggestTimeoutTimer.stop()
     if (suggestProc.running) suggestProc.running = false
     if (root.triageMode) triageView.close()
+    if (root.shelfMode) shelfView.close()
+    root.shelfMode = false
     // Belt-and-braces: reset unconditionally on every close path (Escape,
     // Enter/activate, scrim click, IPC hide, this function in general).
     // Dispatching a submap reset when not in one is harmless, and being
@@ -154,15 +184,54 @@ Item {
   // rather than on Triage.qml because only this Item is the manifest entry
   // point the host (and `omarchy-shell shell call`) can reach.
   function triageMove(arg) {
-    if (!root.opened || !root.triageMode) return "not in triage"
+    if (!root.opened) return "not in triage"
+    if (root.shelfMode) { shelfView.moveCurrent(String(arg)); return "ok" }
+    if (!root.triageMode) return "not in triage"
     triageView.moveCurrent(String(arg))
     return "ok"
   }
 
-  function enterTriageSubmap() {
-    submapProc.command = ["hyprctl", "dispatch", 'hl.dsp.submap("literate-triage")']
+  // Shelf-only IPC entry points, reached the same way triageMove is: from
+  // binds inside the submap the shelf is holding open. They live here because
+  // only this Item is the manifest entry point `omarchy-shell shell call` can
+  // address.
+  function shelfLaunch(kind) {
+    if (!root.opened || !root.shelfMode) return "not in shelf"
+    shelfView.launchWithQuery(String(kind))
+    return "ok"
+  }
+
+  // Select a board by its REAL workspace id, or "summary"/0 for the Jump-to
+  // tile. Exposed so the two Enter paths can be exercised without synthesising
+  // keypresses.
+  function shelfSelect(arg) {
+    if (!root.opened || !root.shelfMode) return "not in shelf"
+    var a = String(arg)
+    if (a === "summary" || a === "0") shelfView.pickTile(0)
+    else shelfView.pickTile(Number(a))
+    return "ok"
+  }
+
+  // `omarchy-shell shell call` always passes an argument, so these take one
+  // and ignore it.
+  function shelfActivate(arg) {
+    if (!root.opened || !root.shelfMode) return "not in shelf"
+    shelfView.activateCurrent()
+    return "ok"
+  }
+
+  function shelfFocusPanel(arg) {
+    if (!root.opened || !root.shelfMode) return "not in shelf"
+    shelfView.select(1)
+    return "ok"
+  }
+
+  function enterSubmap(name) {
+    submapProc.command = ["hyprctl", "dispatch", 'hl.dsp.submap("' + name + '")']
     submapProc.running = true
   }
+
+  function enterTriageSubmap() { root.enterSubmap("literate-triage") }
 
   function resetTriageSubmap() {
     submapProc.command = ["hyprctl", "dispatch", 'hl.dsp.submap("reset")']
@@ -499,9 +568,20 @@ Item {
     }
   }
 
+  // The shelf presentation ({"mode":"shelf"}): its own top-anchored,
+  // full-width PanelWindow hanging off the bar, so it is declared out here
+  // rather than inside the centred card below -- and the card stays hidden
+  // for as long as it is up, or two keyboard-exclusive layer surfaces would
+  // fight over the same keypresses.
+  Shelf {
+    id: shelfView
+    binPath: root.binPath
+    onCloseRequested: root.close()
+  }
+
   PanelWindow {
     id: panel
-    visible: root.opened
+    visible: root.opened && !root.shelfMode
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "literate-overlay"

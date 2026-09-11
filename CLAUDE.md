@@ -521,3 +521,102 @@ measures at **~1% over idle**. A thumbnail a second and a half stale is not
 one anybody can pick out; a fan spinning up while you glance at your
 workspaces is.
 
+## The shelf
+
+`Shelf.qml` is the SUPER+SLASH view: a full-width black shelf of live
+workspace boards over an omnibox panel. Same rules as `Triage.qml` — not a
+manifest entry point, instantiated by `Overlay.qml`, selected by the summon
+payload (`{"mode":"shelf"}`, optionally with `"query"`), and in
+`tools/sync-upstream`'s `--exclude` list along with `Omnibox.js`. Triage keeps
+its own chord on SUPER+SHIFT+SLASH while the two are being compared.
+
+- **It covers the bar; it does not hang below it.** The bar already draws the
+  workspace list, so a shelf drawn underneath showed the same list twice. The
+  surface starts at `y = 0` on `Color.bar.background` and draws its own
+  headers. The bar's other modules (menu button, clock, tray) are hidden for
+  as long as it is up; that is the accepted cost.
+- The transition is a **cross-fade, not a morph**. An earlier version lerped
+  each board from a reconstruction of where the bar draws its labels out to
+  the expanded layout; that can only be seamless if the reconstruction matches
+  the vendored bar's font metrics exactly, and the mismatch read as a snap at
+  the handoff. Two dials drive it instead: `extent` (how far the black surface
+  has grown) and `reveal` (how present the content is). The ORDER on close is
+  the whole trick — `reveal` reaches 0 *before* `extent` starts shrinking, so
+  the frame where the real bar takes over is a frame with nothing of ours
+  drawn.
+- **A board carries the screen's aspect ratio**, computed from the monitor and
+  the compositor's reserved area, never hardcoded. A board at some invented
+  ratio does not read as a workspace. Nine of them at true aspect do not fit
+  at a generous size, so occupied boards share the free width equally up to a
+  height cap and **empty workspaces collapse to outlines** and absorb the
+  slack — they hold nothing, so a board shape would be claiming something
+  false. Windows sit at their real fraction of the usable area
+  (`lastIpcObject.at`/`size`), so the board is a real miniature and a
+  master/stack split looks like one.
+- **The outer height is fixed.** `PanelWindow.implicitHeight` is the layer
+  surface's height, and a Wayland surface that resizes mid-interaction reads
+  as the shelf flinching. A panel height derived from the row count made it
+  flinch every time Tab landed on a workspace with a different number of
+  windows. Same call `Triage.qml` already made about its card.
+- **Anything that moves compositor focus has to wait for this surface to be
+  gone.** The shelf holds exclusive keyboard focus, and when that layer unmaps
+  Hyprland restores focus to the window that had it before — which silently
+  undoes the switch. Verified: "go to workspace 5" dispatched while the shelf
+  is open lands on 5 and bounces back to 3 the moment it closes. `runAfterClose()`
+  queues those dispatches until the collapse animation has hidden the window.
+  Launching something new is unaffected and stays inline.
+- **Selection holds a real workspace id, never a tile ordinal.** They agree
+  only while the boards are a contiguous 1..N, and the place the difference
+  surfaces is the dispatch that switches workspace — i.e. it sends you
+  somewhere else entirely, silently. Proven against a desktop with workspaces
+  1, 2, 3 and 5.
+- **Focus is a region, not just an index.** `focusRegion` says whether Enter
+  belongs to the shelf (go to that workspace) or the panel (act on that row).
+  Without it, hovering board 3 and pressing Enter focused the panel's first
+  row, which was a window on workspace 1.
+- `MouseArea.onPositionChanged` fires whenever the pointer moves **relative to
+  the item**, which includes an item sliding under a stationary pointer. That
+  is how a re-created panel row stole focus back the instant a board was
+  selected. `pointerMoved()` compares against the last position in window
+  coordinates; only real movement counts. This is the same class of bug
+  `Triage.qml`'s `pointerLive` already guards, one level deeper.
+
+## The omnibox's launcher chords
+
+With a query typed, the user's own Terminal / Browser / agent chords act on
+that text instead of launching an empty app. **The chords are discovered, not
+hardcoded**: `hyprctl binds -j` is matched against the human `description`
+field ("Terminal", "Browser", and an ordered preference over "Claude Code
+(Opus)" / "(Sonnet)" / "(Fable)" / "Claude Code" / "Agent"). Rebind Terminal
+tomorrow and the omnibox follows; a description that is not found simply
+yields no affordance.
+
+- The bind's **action** cannot be reused. On this Lua-configured Hyprland
+  every user bind reports `dispatcher: "__lua"` with an opaque callback index
+  as its `arg`, so there is no command string to recover. The commands are
+  reconstructed from Omarchy's own launchers, with one detail taken from the
+  discovery rather than assumed: the agent's model comes out of the matched
+  description, so a user who binds Sonnet gets Sonnet.
+- Those are GLOBAL binds, so the compositor would consume them and launch an
+  empty terminal — the same trap SUPER+SHIFT+digit hit. They are shadowed in a
+  submap. Since the chords are discovered, the submap is **defined at
+  runtime**: `hyprctl keyword` is refused here ("keyword can't work with
+  non-legacy parsers, use eval"), but `hyprctl eval` runs Lua in the config's
+  own context, where `hl.define_submap` and `hl.bind` are both callable.
+- Redefining a submap name **appends to it rather than replacing it** — a
+  shell restart once left one submap holding both the old and the new Escape
+  bind. Each definition therefore gets a wall-clock generation name, which
+  also has to be unique across restarts because a runtime submap outlives the
+  shell. Same lesson as the Lua layout API.
+- **Plain Escape must never be bound in these submaps.** It was, as a safety
+  exit, and that made Escape take two presses: the compositor ate the first,
+  reset the submap and *spawned a process* to ask the overlay to hide, so
+  nothing visibly happened; only the second press reached the client. It also
+  meant the overlay's "clear the query first, close only when it is already
+  empty" never ran. The safety net lives on SUPER+Escape.
+- Terminal opens the query **pre-filled but not executed** — running arbitrary
+  typed text as a shell command out of a search box is a foot-gun. The line
+  gets into readline's buffer via the terminal's own Device Status Report
+  reply (`printf '\e[5n'` → the terminal answers `\e[0n` → readline expands
+  the macro bound to it). A query that is an existing directory opens the
+  terminal *there* instead.
