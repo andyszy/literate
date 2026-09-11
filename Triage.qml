@@ -61,22 +61,44 @@ Item {
   // so a stationary mouse cannot hijack the cursor as rows reflow underneath it.
   property bool pointerLive: false
 
+  // Whether the pinned query row (see queryAction) holds the cursor rather
+  // than the result list. Not an index into the list: it is one row, above
+  // everything, that never scrolls.
+  property bool actionFocused: false
+  // ...and it takes over automatically when there is nothing else to land on,
+  // because "Enter does nothing" is not an acceptable state for the surface
+  // that replaced the address bar.
+  readonly property bool actionActive: root.actionFocused
+    || root.selectableRows.length === 0
+
   function setQuery(text) {
     if (root.query === text) return
     root.query = text
     root.pointerLive = false
     root.cursor = 0 // first visible row, every time the query changes
+    // A query that is already a location is not a search for anything: the
+    // pinned row IS the answer. Anything else leaves the cursor on the best
+    // result, one arrow key above the fallback.
+    var action = Omnibox.urlOrSearch(text, root.searchEngine)
+    root.actionFocused = !!(action && action.kind === "open")
   }
 
   function matchesQuery(haystack) {
     return String(haystack || "").toLowerCase().indexOf(root.query.toLowerCase()) >= 0
   }
 
-  function open() {
+  // An initial query may arrive on the summon payload
+  // ({"mode":"triage","query":"gm"}), the same way the shelf takes one: it is
+  // the only way to exercise the typed state without a keyboard, and
+  // summoning straight into an answer is the same view either way.
+  function open(armedProfile, initialQuery) {
+    root.armProfile(armedProfile)
     root.failed = false
     root.errorText = ""
     root.cursor = 0
     root.query = ""
+    root.actionFocused = false
+    if (initialQuery) root.setQuery(String(initialQuery))
     // Paint the daemon's precomputed grouping in this frame rather than
     // waiting on a process to tell us the same thing. If it is still current
     // --triage confirms it in ~45ms and nothing moves; if the desktop has
@@ -213,6 +235,62 @@ Item {
 
   function stripStatusGlyphs(title) { return Omnibox.stripStatusGlyphs(title) }
 
+  // --------------------------------------------------- the typed query
+  //
+  // The row that is always there: "Open <url>" when the text is a location,
+  // "Search the web for <query>" when it is not, and -- with nothing typed at
+  // all -- a plain browser window, since no keybind opens one any more. Same
+  // rules as Shelf.qml because they are the same rules, in Omnibox.js.
+  readonly property var searchEngine: (root.omniboxIndex && root.omniboxIndex.search)
+    ? root.omniboxIndex.search : null
+  readonly property var queryAction: Omnibox.urlOrSearch(root.query, root.searchEngine)
+    || Omnibox.newWindowAction()
+
+  // ------------------------------------------------------- Chrome profiles
+  //
+  // THE KEY DECIDES, NEVER THE ROW: Enter opens in the armed profile,
+  // Shift+Enter in the next one, whatever profile the matched history row was
+  // recorded in. See CLAUDE.md -- Gmail and Drive accumulate history in both
+  // accounts, so a rule derived from the row sends the same keystroke
+  // somewhere different on different days.
+  readonly property var chromeProfiles:
+    (root.omniboxIndex && Array.isArray(root.omniboxIndex.profiles))
+      ? root.omniboxIndex.profiles : []
+  property int enterAt: 0
+  property int shiftOffset: 1
+
+  function profileAt(i) {
+    var n = root.chromeProfiles.length
+    return n === 0 ? null : root.chromeProfiles[((i % n) + n) % n]
+  }
+
+  readonly property var enterProfile: root.profileAt(root.enterAt)
+  readonly property var shiftProfile: root.chromeProfiles.length > 1
+    ? root.profileAt(root.enterAt + root.shiftOffset) : null
+
+  function armProfile(directory) {
+    root.shiftOffset = 1
+    root.enterAt = 0
+    var wanted = String(directory || "")
+    if (!wanted) return
+    for (var i = 0; i < root.chromeProfiles.length; i++)
+      if (root.chromeProfiles[i] && root.chromeProfiles[i].dir === wanted) {
+        root.enterAt = i
+        return
+      }
+  }
+
+  function cycleShiftProfile() {
+    var n = root.chromeProfiles.length
+    if (n <= 2) return
+    root.shiftOffset = (root.shiftOffset % (n - 1)) + 1
+  }
+
+  function profileName(profile) {
+    // Display name only: "Profile 1" is an internal identifier.
+    return (profile && profile.name) ? String(profile.name) : ""
+  }
+
   // Claude Code sets an org.omarchy.claude terminal's window title to the
   // conversation's ai-title, so a live window whose (glyph-stripped) title
   // matches the index entry IS that conversation, already open -- jump to
@@ -251,8 +329,15 @@ Item {
     launchProc.running = true
   }
 
-  function openUrlInBrowser(url) {
-    var cmd = "omarchy launch browser " + Util.shellQuote(url)
+  // `secondary` is the Shift half of the chord, not a property of the row.
+  // An empty url means "just a window", which is the empty-query action.
+  function openUrlInBrowser(url, secondary) {
+    var profile = secondary ? root.shiftProfile : root.enterProfile
+    var target = url ? (" " + Util.shellQuote(url)) : " --new-window"
+    var cmd = (profile && profile.dir)
+      ? ("setsid uwsm-app -- google-chrome-stable --profile-directory="
+         + Util.shellQuote(profile.dir) + target)
+      : ("omarchy launch browser" + target)
     launchProc.command = ["hyprctl", "dispatch", root.execCmdDispatch(cmd)]
     launchProc.running = true
   }
@@ -269,9 +354,9 @@ Item {
     root.launchClaudeResume(conv.id, conv.project)
   }
 
-  function openHistoryEntry(hist) {
+  function openHistoryEntry(hist, secondary) {
     if (!hist || !hist.url) return
-    root.openUrlInBrowser(hist.url)
+    root.openUrlInBrowser(hist.url, secondary)
   }
 
   readonly property int visibleWindowCount: {
@@ -321,6 +406,35 @@ Item {
   // conversation or history row -- those get an Enter-only hint, so
   // SUPER+SHIFT+<n> reads as (and is, see moveCurrent()) a no-op rather
   // than something surprising.
+  // True when Enter would hand a URL to a browser, i.e. when the profile
+  // question even arises.
+  function opensInBrowser() {
+    if (root.actionActive) return true
+    var row = root.currentRow()
+    return !!(row && row.kind === "history")
+  }
+
+  // What Enter does right now, in words. When it opens a link it names the
+  // ACCOUNT rather than the verb: with two profiles the interesting half of
+  // "open" is which one, and it is stated rather than implied so Shift+Enter
+  // is never a guess.
+  function enterHint() {
+    var primary = root.profileName(root.enterProfile)
+    var secondary = root.profileName(root.shiftProfile)
+    var suffix = (root.chromeProfiles.length > 2) ? " (⌃⇥ next)" : ""
+    if (root.opensInBrowser() && primary)
+      return "⏎ " + primary + (secondary ? " · ⇧⏎ " + secondary : "") + suffix
+    if (root.actionActive)
+      return "⏎ " + (root.queryAction && root.queryAction.kind === "open" ? "open it"
+        : root.queryAction && root.queryAction.kind === "window" ? "new window"
+        : "search the web")
+    var row = root.currentRow()
+    var verb = (row && row.kind === "conversation") ? "resume" : "focus"
+    return "⏎ " + verb
+      + (primary ? ("    links ⏎ " + primary
+                    + (secondary ? " · ⇧⏎ " + secondary : "") + suffix) : "")
+  }
+
   readonly property string scopeHint: {
     var row = root.currentRow()
     if (!row) return ""
@@ -337,10 +451,19 @@ Item {
 
   function select(delta) {
     var n = root.selectableRows.length
-    if (n === 0) return
     // Arrowing scrolls the list, which slides rows under a stationary pointer;
     // park the mouse again so its hover cannot fight the keyboard.
     root.pointerLive = false
+    if (root.actionFocused) {
+      if (delta > 0 && n > 0) {
+        root.actionFocused = false
+        root.cursor = 0
+        listView.positionViewAtIndex(root.selectableRows[0], ListView.Contain)
+      }
+      return
+    }
+    if (n === 0) { root.actionFocused = true; return }
+    if (delta < 0 && root.cursor === 0) { root.actionFocused = true; return }
     root.cursor = (root.cursor + delta + n) % n
     listView.positionViewAtIndex(root.selectableRows[root.cursor], ListView.Contain)
   }
@@ -349,7 +472,7 @@ Item {
   // selectableRows -- this is what a click hands back.
   function selectRow(flatIndex) {
     var pos = root.selectableRows.indexOf(flatIndex)
-    if (pos >= 0) root.cursor = pos
+    if (pos >= 0) { root.cursor = pos; root.actionFocused = false }
   }
 
   // ---------------------------------------------------------------- actions
@@ -358,7 +481,12 @@ Item {
   // first (visible) window -- computeRows() guarantees the row immediately
   // after a header is a window of that same category, since a header with
   // no visible windows is never emitted.
-  function focusCurrent() {
+  function focusCurrent(secondary) {
+    if (root.actionActive) {
+      root.openUrlInBrowser(root.queryAction ? root.queryAction.url : "", secondary)
+      root.closeRequested()
+      return
+    }
     var row = root.currentRow()
     if (!row) return
 
@@ -368,7 +496,7 @@ Item {
       return
     }
     if (row.kind === "history") {
-      root.openHistoryEntry(row.history)
+      root.openHistoryEntry(row.history, secondary)
       root.closeRequested()
       return
     }
@@ -399,6 +527,7 @@ Item {
   // the current search happens to show -- unchanged from this function's
   // original category-only behaviour).
   function moveCurrent(target) {
+    if (root.actionActive) return   // a URL has no workspace to be moved to
     var row = root.currentRow()
     if (!row) return
     // Only open windows/categories have a workspace to move to -- a
@@ -451,8 +580,12 @@ Item {
     } else if (event.key === Qt.Key_Down) {
       root.select(1)
       event.accepted = true
+    } else if (event.key === Qt.Key_Tab && (event.modifiers & Qt.ControlModifier)) {
+      root.cycleShiftProfile()   // only does anything with three or more
+      event.accepted = true
     } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-      root.focusCurrent()
+      // Shift is the profile switch and nothing else: same row, other account.
+      root.focusCurrent((event.modifiers & Qt.ShiftModifier) !== 0)
       event.accepted = true
     } else if (Util.editsFilter(event, root.query)) {
       root.setQuery(Util.editedFilter(event, root.query))
@@ -645,47 +778,131 @@ Item {
   property color selectedBackground: Color.menu.selectedBackground
   property color selectedText: Color.menu.selectedText
   property string fontFamily: Style.font.menuFamily
-  property int headerHeight: Math.max(Style.space(28), Style.font.heading + Style.spacing.controlPaddingY * 2)
   property int catHeaderHeight: Style.space(30)
   property int rowHeight: Math.max(Style.space(34), Style.font.body + Style.spacing.rowPaddingX * 2)
+  // The hero. Big enough that the surface reads as a thing you type into
+  // before anything has been typed, which is the whole difference between
+  // this and a dialog that happens to accept keys.
+  property int inputFontSize: Style.font.displayLarge
+  property int inputHeight: Math.max(Style.space(62), root.inputFontSize + Style.space(28))
+  property int footerHeight: Style.space(24)
 
   // ----------------------------------------------------------------- layout
+  //
+  // Spotlight, not a dialog. The card Overlay.qml draws for this mode is 60%
+  // of the monitor's width and sits ABOVE centre (see triageTopFraction
+  // there), because results grow downward and a vertically centred box drifts
+  // below the eye as it fills. Inside it, the hero is the input: a single
+  // large line with a caret and a placeholder, so the surface says "type"
+  // before anything has been typed. Everything else -- the pinned action, the
+  // results, the hints -- hangs below it in that order.
+  //
+  // The card's outer geometry NEVER changes while it is open (Overlay.qml
+  // fixes both dimensions): a search box that resizes on every keystroke is
+  // unsettling to type into, and this was already fixed once.
 
   Item {
-    id: header
+    id: searchField
     anchors.top: parent.top
     anchors.left: parent.left
     anchors.right: parent.right
-    height: root.headerHeight
+    height: root.inputHeight
 
     Text {
-      textFormat: Text.PlainText
+      id: searchIcon
       anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      text: root.glyph("magnifying-glass")
+      color: Util.alpha(root.foreground, 0.35)
+      font.family: phosphor.font.family
+      font.pixelSize: Style.font.display
+    }
+
+    Row {
+      anchors.left: searchIcon.right
+      anchors.leftMargin: Style.space(12)
+      anchors.right: counts.left
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: 0
+      clip: true
+
+      Text {
+        id: queryText
+        textFormat: Text.PlainText
+        text: root.query
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: root.inputFontSize
+      }
+
+      // A caret that blinks is the cheapest way to say "this is a thing you
+      // type into" to someone who has not typed yet.
+      Text {
+        id: caret
+        text: "▮"
+        color: Util.alpha(root.foreground, 0.75)
+        font.family: root.fontFamily
+        font.pixelSize: root.inputFontSize
+        SequentialAnimation on opacity {
+          running: true
+          loops: Animation.Infinite
+          NumberAnimation { from: 1.0; to: 0.15; duration: 620; easing.type: Easing.InOutQuad }
+          NumberAnimation { from: 0.15; to: 1.0; duration: 620; easing.type: Easing.InOutQuad }
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        visible: root.query.length === 0
+        leftPadding: Style.space(6)
+        text: "Search or type a URL"
+        color: Util.alpha(root.foreground, 0.38)
+        font.family: root.fontFamily
+        font.pixelSize: root.inputFontSize
+        elide: Text.ElideRight
+      }
+    }
+
+    // The counts that used to be the header line, demoted to a quiet
+    // right-hand note: they describe the results, they are not the title.
+    Text {
+      id: counts
+      textFormat: Text.PlainText
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      // The " · refreshing…" tail is the whole of the drift hint: rows that
-      // are already readable do not deserve a bar drawn over the top of them.
-      // The scope hint trails everything else -- it's the least essential
-      // part of the line, so it's the first thing elide sacrifices.
+      horizontalAlignment: Text.AlignRight
       text: (root.query.length > 0
-        ? ("Search: " + root.query + "▮"
-           + " · " + root.visibleWindowCount + (root.visibleWindowCount === 1 ? " window" : " windows")
-           + " · " + root.visibleCategoryCount + (root.visibleCategoryCount === 1 ? " category" : " categories"))
-        : ("Triage" + (root.windows.length > 0
-            ? (" · " + root.windows.length + (root.windows.length === 1 ? " window" : " windows")
-               + " · " + root.categories.length + (root.categories.length === 1 ? " category" : " categories"))
-            : ""))) + (root.refreshing ? " · refreshing…" : "")
-        + (root.scopeHint ? " · " + root.scopeHint : "")
-      color: root.foreground
+        ? (root.visibleWindowCount + (root.visibleWindowCount === 1 ? " window" : " windows")
+           + " · " + root.visibleCategoryCount
+           + (root.visibleCategoryCount === 1 ? " category" : " categories"))
+        : (root.windows.length > 0
+            ? (root.windows.length + (root.windows.length === 1 ? " window" : " windows")
+               + " · " + root.categories.length
+               + (root.categories.length === 1 ? " category" : " categories"))
+            : ""))
+        + (root.refreshing ? " · refreshing…" : "")
+      color: Util.alpha(root.foreground, 0.45)
       font.family: root.fontFamily
-      font.pixelSize: Style.font.heading
+      font.pixelSize: Style.font.bodySmall
       elide: Text.ElideRight
     }
   }
 
+  // One hairline under the input, which is the whole of the chrome: the card
+  // itself is borderless in this mode and leans on its shadow instead.
+  Rectangle {
+    id: inputRule
+    anchors.top: searchField.bottom
+    anchors.left: parent.left
+    anchors.right: parent.right
+    height: Math.max(1, Style.spacing.hairline)
+    color: Util.alpha(root.foreground, 0.10)
+  }
+
   Item {
     id: status
-    anchors.top: header.bottom
+    anchors.top: inputRule.bottom
     anchors.topMargin: height > 0 ? Style.spacing.md : 0
     anchors.left: parent.left
     anchors.right: parent.right
@@ -742,33 +959,102 @@ Item {
     }
   }
 
+  // The pinned query action: always present, always on screen, never scrolled.
+  // See Omnibox.urlOrSearch() and CLAUDE.md -- with no address bar left there
+  // must be no state in which Enter does nothing with what was typed.
+  Item {
+    id: actionRow
+    anchors.top: status.bottom
+    anchors.topMargin: Style.spacing.sm
+    anchors.left: parent.left
+    anchors.right: parent.right
+    height: root.rowHeight
+
+    readonly property bool hasCursor: root.actionActive
+    readonly property color fg: actionRow.hasCursor ? root.selectedText : root.foreground
+
+    Rectangle {
+      anchors.fill: parent
+      visible: actionRow.hasCursor
+      radius: Style.cornerRadius
+      color: root.selectedBackground
+    }
+
+    Row {
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(10)
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(6)
+
+      Text {
+        text: root.glyph(!root.queryAction ? "magnifying-glass"
+          : root.queryAction.kind === "open" ? "arrow-up-right"
+          : root.queryAction.kind === "window" ? "browser" : "magnifying-glass")
+        color: actionRow.fg
+        font.family: phosphor.font.family
+        font.pixelSize: Style.font.body
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        width: parent.width - Style.space(20)
+        text: root.queryAction ? root.queryAction.label : ""
+        color: actionRow.fg
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        elide: Text.ElideRight
+      }
+    }
+
+    MouseArea {
+      id: actionMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: if (root.pointerLive) root.actionFocused = true
+      onPositionChanged: {
+        if (root.pointerLive) return
+        root.pointerLive = true
+        root.actionFocused = true
+      }
+      onClicked: {
+        root.pointerLive = true
+        root.actionFocused = true
+        root.focusCurrent()
+      }
+    }
+  }
+
   Text {
     id: noMatches
     textFormat: Text.PlainText
     visible: root.query.length > 0 && root.rows.length === 0 && !root.blocking && !root.failed
-    anchors.top: status.bottom
+    anchors.top: actionRow.bottom
     anchors.topMargin: Style.spacing.md
     anchors.left: parent.left
     anchors.right: parent.right
-    text: "No matches for “" + root.query + "”"
+    anchors.leftMargin: Style.space(10)
+    text: "No matches for “" + root.query + "” — ⏎ still opens what you typed"
     color: root.foreground
-    opacity: 0.7
+    opacity: 0.55
     font.family: root.fontFamily
-    font.pixelSize: Style.font.body
+    font.pixelSize: Style.font.bodySmall
     elide: Text.ElideRight
   }
 
   ListView {
     id: listView
-    anchors.top: status.bottom
-    anchors.topMargin: Style.spacing.md
+    anchors.top: actionRow.bottom
+    anchors.topMargin: Style.spacing.xs
     anchors.left: parent.left
     anchors.right: parent.right
-    anchors.bottom: parent.bottom
+    anchors.bottom: footer.top
+    anchors.bottomMargin: Style.spacing.xs
     clip: true
     spacing: 0
     model: root.rows
-
     delegate: Item {
       id: rowRoot
       required property int index
@@ -849,7 +1135,7 @@ Item {
 
         Text {
           textFormat: Text.PlainText
-          width: parent.width - Style.space(20)
+          width: parent.width - Style.space(20) - profileMark.width
           text: rowRoot.isHeader ? (rowRoot.modelData.name + " (" + rowRoot.modelData.count + ")")
             : rowRoot.isConversation ? (rowRoot.modelData.conversation.title
                 + (rowRoot.modelData.conversation.messages
@@ -862,6 +1148,19 @@ Item {
           font.bold: rowRoot.isHeader
           font.pixelSize: Style.font.body
           elide: Text.ElideRight
+        }
+
+        // Which account(s) this URL has been seen in -- initials of the
+        // display names. NOT where Enter will open it: that is the key's
+        // decision, and the footer states it.
+        Text {
+          id: profileMark
+          textFormat: Text.PlainText
+          text: rowRoot.isHistory ? Omnibox.profileMark(rowRoot.modelData.history) : ""
+          color: rowRoot.hasCursor ? root.selectedText : root.foreground
+          opacity: 0.45
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
         }
       }
 
@@ -910,6 +1209,31 @@ Item {
           root.focusCurrent()
         }
       }
+    }
+  }
+
+  Item {
+    id: footer
+    anchors.left: parent.left
+    anchors.right: parent.right
+    anchors.bottom: parent.bottom
+    height: root.footerHeight
+
+    Text {
+      anchors.fill: parent
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      verticalAlignment: Text.AlignVCenter
+      textFormat: Text.PlainText
+      text: {
+        var hint = "↑↓ item    " + root.enterHint()
+        if (root.scopeHint && !root.actionActive) hint += "    " + root.scopeHint
+        return hint + "    esc " + (root.query.length > 0 ? "clear" : "close")
+      }
+      color: Util.alpha(root.foreground, 0.45)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
     }
   }
 }

@@ -361,6 +361,19 @@ real workspace, grouped by activity via `literate-workspace-namer --triage`.
 It is a fork-owned file exactly like `Workspaces.qml` and `Overlay.qml` —
 it must stay in `tools/sync-upstream`'s `--exclude` list.
 
+- **It is shaped like Spotlight, and the proportions are load-bearing.** The
+  card is 60% of the monitor's logical width and 46% of its height, with its
+  top edge at 20% -- all measured off the panel, never hardcoded. The top
+  fraction only means something *against the height*: the obvious-looking 24%
+  put a 52%-tall card at dead centre, which is exactly what "above centre"
+  was supposed to avoid. Inside, the hero is a single large input line with a
+  blinking caret and a placeholder, because a search surface has to say "type
+  here" before anything is typed; results grow downward from it, which is why
+  the box sits high. There is no border in this mode -- a hard edge round a
+  floating surface reads as a dialog -- so `CardShadow` is the only separation
+  and runs a little heavier. The outer geometry is FIXED while open (verified
+  identical, 907x452 at 303,196, between the empty and typed states): a box
+  that resizes on every keystroke is unsettling to type into.
 - It is **not** a manifest entry point. The obvious design — a new `"panel"`
   kind with `entryPoints.panel: "Triage.qml"` — doesn't work: shell.qml's
   `computePanelEntries()` builds exactly one panel/overlay/menu Loader **per

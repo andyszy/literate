@@ -127,7 +127,9 @@ Item {
       root.suggestedIcon = ""
       root.suggestedWindows = []
       root.groups = []
-      triageView.open()
+      // "profile" arms which Chrome profile Enter opens links in for this
+      // invocation; absent, it is the configured primary.
+      triageView.open(payload.profile, payload.query)
       // SUPER+SHIFT+<n> ("move category to workspace N") is a GLOBAL
       // Hyprland bind, so the compositor would consume it before triage (a
       // plain Wayland client) ever sees the keypress. Shadow it for as long
@@ -494,11 +496,26 @@ Item {
   property int workspaceCardHeight: Math.min(
     contentMargin * 2 + headerHeight + (statusHeight > 0 ? contentSpacing + statusHeight : 0) + contentSpacing + rowsHeight,
     panel.height - Style.gapsOut * 2)
-  // Triage surveys every window on every workspace, not one workspace's --
-  // it earns most of the screen, capped so it doesn't look absurd on an
-  // ultrawide monitor.
-  property int triageCardWidth: Math.min(panel.width - Style.gapsOut * 4, Style.space(1200))
-  property int triageCardHeight: panel.height - Style.gapsOut * 4
+  // Spotlight proportions, measured off the monitor rather than fixed: 60% of
+  // the logical width is wide enough for a URL and a title side by side and
+  // narrow enough that the eye does not have to travel, which is roughly what
+  // macOS settled on.
+  property int triageCardWidth: Math.max(Style.space(420),
+    Math.min(Math.round(panel.width * 0.6), panel.width - Style.gapsOut * 4))
+  // A FIXED height rather than one that grows with the results: the card is a
+  // search surface, and a box that changes size on every keystroke is
+  // unsettling to type into.
+  property int triageCardHeight: Math.min(
+    Math.round(panel.height * 0.46), panel.height - Style.gapsOut * 4)
+  // ...and it sits ABOVE centre. Results grow downward from the input, so a
+  // vertically centred box puts the input at the middle of the screen and the
+  // answers below the eye. A fifth of the way down keeps the thing you type
+  // into at eye level and leaves the growth room underneath it, which is the
+  // reason Spotlight sits where it does. The fraction only means anything
+  // against the height above: the obvious-looking 24% put a half-screen card
+  // at dead centre. This puts the input at ~24% and the card's own centre at
+  // 43%.
+  readonly property real triageTopFraction: 0.20
   property int cardWidth: root.triageMode ? root.triageCardWidth : root.workspaceCardWidth
   property int cardHeight: root.triageMode ? root.triageCardHeight : root.workspaceCardHeight
 
@@ -613,6 +630,10 @@ Item {
     // separate item rather than an effect on `card` itself.
     CardShadow {
       target: card
+      // The triage card has no border in this mode, so the shadow is the only
+      // thing separating it from the desktop: large, soft and a little
+      // heavier than the workspace menu's.
+      intensity: root.triageMode ? 0.34 : 0.24
     }
 
     BorderSurface {
@@ -620,9 +641,15 @@ Item {
       width: root.cardWidth
       height: root.cardHeight
       radius: root.cornerRadius
-      anchors.centerIn: parent
+      // Horizontally centred always; vertically centred for the workspace
+      // menu, above centre for Spotlight (see triageTopFraction).
+      x: Math.round((panel.width - card.width) / 2)
+      y: root.triageMode ? Math.round(panel.height * root.triageTopFraction)
+                         : Math.round((panel.height - card.height) / 2)
       color: root.background
-      borderSpec: root.borderSpec
+      // No border in Spotlight mode: a hard edge round a floating search
+      // surface reads as a dialog. The shadow does the separating.
+      borderSpec: root.triageMode ? Border.none() : root.borderSpec
       padding: root.contentMargin
 
       MouseArea { anchors.fill: parent; onClicked: {} }
