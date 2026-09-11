@@ -515,11 +515,13 @@ The sticking point is the mapping, and Hyprland's own module solves it:
   fills asynchronously. Anything that walks it has to do so later.
 
 Cost: nine `live: true` views cost the shell **~16% of a core** for as long as
-they are on screen. The shelf therefore sets `live: false` and pulls one frame
-per view off a 1.5 s timer that only runs while the surface is visible, which
-measures at **~1% over idle**. A thumbnail a second and a half stale is not
-one anybody can pick out; a fan spinning up while you glance at your
-workspaces is.
+they are on screen. The shelf therefore streams only while it is filling in
+(`live` follows a 600 ms priming flag) and freezes after that, which measures
+at **0% over idle** once open. A picture that stops moving after the first
+frame is not one anybody can pick out during a glance; a fan spinning up is.
+`captureFrame()` is not an alternative to priming: called before the capture
+session exists it warns "no recording context is ready" and returns nothing,
+and there is no signal for when that becomes true.
 
 ## The shelf
 
