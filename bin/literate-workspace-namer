@@ -8,6 +8,7 @@ an icon. Results land in a JSON file the bar widget watches.
   state:  ~/.local/state/literate/workspaces.json
   pinned: ~/.local/state/literate/pinned.json
   cache:  ~/.local/state/literate/cache.json
+  triage: ~/.local/state/literate/triage.json
   config: ~/.config/literate/config.json
 
   literate-workspace-namer                 run as a daemon
@@ -19,6 +20,7 @@ an icon. Results land in a JSON file the bar widget watches.
   literate-workspace-namer --unpin ID            drop a pin; back to model-named
 """
 
+import hashlib
 import json
 import os
 import re
@@ -46,6 +48,10 @@ CONFIG_PATH = HOME / ".config/literate/config.json"
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 STATE_PATH = STATE_DIR / "workspaces.json"
 CACHE_PATH = STATE_DIR / "cache.json"
+# The daemon's precomputed --triage answer, so pressing the triage key costs a
+# file read instead of a model round-trip. Keyed on a hash of the whole window
+# set; a miss just falls back to asking live.
+TRIAGE_PATH = STATE_DIR / "triage.json"
 # Kept apart from STATE_PATH because that file is rewritten wholesale every
 # pass -- a pin stored inside it would be gone the next time the model runs.
 PINNED_PATH = STATE_DIR / "pinned.json"
@@ -85,6 +91,16 @@ DEFAULTS = {
     "local_url": "http://127.0.0.1:8080/v1/chat/completions",
     "local_model": "local",
     "request_timeout": 120,
+    # After a settled naming pass, also work out the --triage grouping for the
+    # current window set and cache it, so the triage view opens instantly
+    # instead of waiting on a model call. Costs one extra call per settled
+    # change to the *global* window set. False = exactly the old behaviour.
+    "triage_precompute": True,
+    # ...but never more often than this. The naming cache is per workspace, so
+    # one noisy title only re-asks about one workspace; the triage signature is
+    # global, so the same noise would re-ask about everything. This is the floor
+    # that keeps that from turning into a call every debounce window.
+    "triage_min_interval": 30.0,
 }
 
 # Almost every GUI app appends its own name to the title. Left in, the model
@@ -457,6 +473,11 @@ class Namer:
         self.pinned = load_json(PINNED_PATH, {})
         self.lock = threading.Lock()
         self.pass_lock = threading.Lock()
+        # Triage precompute runs outside pass_lock (naming must never wait on
+        # it), so it needs its own non-blocking guard against overlapping.
+        self.triage_lock = threading.Lock()
+        self.triage_sig = None
+        self.triage_at = float("-inf")
         self.timer = None
         self.first_event = None
         self.last_sigs = {}
@@ -516,14 +537,26 @@ class Namer:
             if suffix:
                 raw[i][2] = raw[i][2] + suffix
 
-    def snapshot(self):
+    @staticmethod
+    def group_by_workspace(clients):
         """workspace id -> list of (class, title), for real workspaces only."""
         by_ws = {}
-        for ws, cls, title, _addr in self._filtered_clients():
+        for ws, cls, title, _addr in clients:
             by_ws.setdefault(str(ws), []).append((cls, title))
         for wins in by_ws.values():
             wins.sort()
         return by_ws
+
+    @staticmethod
+    def triage_windows(clients):
+        """The flat, indexed window list --triage groups and the triage cache
+        stores. Split out from triage() so a pass can build it from the client
+        list it already has, without a second hyprctl call."""
+        return [{"index": i, "address": addr, "class": cls, "title": title, "workspace": str(ws)}
+                for i, (ws, cls, title, addr) in enumerate(clients)]
+
+    def snapshot(self):
+        return self.group_by_workspace(self._filtered_clients())
 
     def workspace_windows(self, ws_id):
         """Every (filtered) window on one workspace, in hyprctl's own order,
@@ -535,6 +568,15 @@ class Namer:
     @staticmethod
     def signature(windows):
         return json.dumps(windows, sort_keys=True)
+
+    @staticmethod
+    def triage_signature(windows):
+        """A hash of the whole window set: every window's address, class,
+        title and workspace. Sorted first, so merely reordering hyprctl's
+        reply -- which happens on focus changes -- is not a change. This is
+        the key the precomputed triage cache is stored and matched under."""
+        key = sorted([w["address"], w["class"], w["title"], w["workspace"]] for w in windows)
+        return hashlib.sha1(json.dumps(key).encode()).hexdigest()
 
     # ------------------------------------------------------------------- model
 
@@ -669,18 +711,24 @@ class Namer:
 
     # -------------------------------------------------------------------- pass
 
-    def run_pass(self):
+    def run_pass(self, precompute=False):
         started = time.monotonic()  # see the cleared_at check in apply()
         with self.pass_lock:
             try:
-                current = self.snapshot()
+                clients = list(self._filtered_clients())
             except Exception as e:
                 log("snapshot failed:", e)
                 return
             # Cheap, and lets `--pin`/`--unpin` from another process take
             # effect without restarting the daemon.
             self.pinned = load_json(PINNED_PATH, {})
-            self.apply(current, started)
+            self.apply(self.group_by_workspace(clients), started)
+        # Deliberately outside pass_lock: naming is the job, triage is
+        # opportunistic, and a slow model call here must not hold up the next
+        # naming pass. Only the daemon's own debounced fire() asks for it --
+        # `--once` stays a single-call operation.
+        if precompute:
+            self.maybe_precompute_triage(self.triage_windows(clients))
 
     def apply(self, current, started):
         pending, resolved, sigs = {}, {}, {}
@@ -814,19 +862,21 @@ class Namer:
 
     def triage(self):
         """Every window on every real workspace, one model call, grouped by
-        what the person is doing rather than which app is open. Pure read
-        path like --suggest -- no cache, no state file, no daemon loop.
+        what the person is doing rather than which app is open. Still asks the
+        model every time; reading the daemon's cache is the next commit.
         Returns (payload, exit_code)."""
         try:
-            windows = [
-                {"index": i, "address": addr, "class": cls, "title": title, "workspace": str(ws)}
-                for i, (ws, cls, title, addr) in enumerate(self._filtered_clients())
-            ]
+            windows = self.triage_windows(list(self._filtered_clients()))
         except Exception as e:
             return {"error": f"hyprctl failed: {e}"[:200]}, 1
         if not windows:
             return {"categories": [], "windows": []}, 0
+        return self.compute_triage(windows)
 
+    def compute_triage(self, windows):
+        """The model call and all the validation behind it. Shared verbatim by
+        --triage's live path and the daemon's precompute, so the two can't
+        drift into disagreeing about the shape of the answer."""
         try:
             raw = self.ask(triage_system_prompt(), triage_user_prompt(windows))
             data = extract_json(raw)
@@ -868,6 +918,77 @@ class Namer:
             })
 
         return {"categories": categories, "windows": windows}, 0
+
+    # -------------------------------------------------------- triage cache
+
+    @staticmethod
+    def read_triage_cache(signature):
+        """The cached grouping if it was computed for exactly this window set,
+        else None. A missing, truncated or hand-mangled file is a miss, never
+        an error -- the caller just asks the model instead."""
+        data = load_json(TRIAGE_PATH, None)
+        if not isinstance(data, dict) or data.get("signature") != signature:
+            return None
+        categories, windows = data.get("categories"), data.get("windows")
+        if not isinstance(categories, list) or not isinstance(windows, list):
+            return None
+        return {"categories": categories, "windows": windows,
+                "updatedAt": data.get("updatedAt")}
+
+    @staticmethod
+    def write_triage_cache(signature, payload):
+        write_atomic(TRIAGE_PATH, {
+            "signature": signature,
+            "categories": payload.get("categories") or [],
+            "windows": payload.get("windows") or [],
+            "updatedAt": int(time.time()),
+        })
+
+    def maybe_precompute_triage(self, windows):
+        """Work out the triage grouping for the window set a settled pass just
+        saw, so the triage key is a file read rather than a model call.
+
+        Everything here is a reason not to ask:
+          - switched off, or nothing is open;
+          - this exact window set is already grouped (in memory, or on disk
+            from another process's live --triage), so never twice for one
+            signature;
+          - the last precompute was too recent -- the naming cache is per
+            workspace, but this signature is global, so one chatty title would
+            otherwise re-ask about the whole desktop every debounce window;
+          - one is already in flight.
+        A failure is logged and dropped: the signature is not recorded, so the
+        next settled pass retries, and --triage meanwhile just asks live."""
+        if not self.cfg.get("triage_precompute", True) or not windows:
+            return
+        signature = self.triage_signature(windows)
+        if signature == self.triage_sig:
+            return
+        if self.read_triage_cache(signature) is not None:
+            self.triage_sig = signature
+            return
+        now = time.monotonic()
+        wait = self.cfg["triage_min_interval"] - (now - self.triage_at)
+        if wait > 0:
+            log(f"triage precompute skipped ({wait:.0f}s under the {self.cfg['triage_min_interval']:.0f}s floor)")
+            return
+        if not self.triage_lock.acquire(blocking=False):
+            return
+        try:
+            self.triage_at = now
+            t0 = time.time()
+            payload, code = self.compute_triage(windows)
+            if code != 0:
+                log("triage precompute failed:", payload.get("error"))
+                return
+            self.write_triage_cache(signature, payload)
+            self.triage_sig = signature
+            log(f"triage precomputed: {len(windows)} windows -> "
+                f"{len(payload['categories'])} categories in {time.time() - t0:.1f}s")
+        except Exception as e:  # opportunistic: never let this wedge the daemon
+            log("triage precompute failed:", e)
+        finally:
+            self.triage_lock.release()
 
     # --------------------------------------------------------------------- pin
 
@@ -967,7 +1088,7 @@ class Namer:
     def fire(self):
         with self.lock:
             self.first_event = None
-        self.run_pass()
+        self.run_pass(precompute=True)
 
     def listen_forever(self):
         """Reconnect rather than die: the socket goes away on Hyprland reload."""
