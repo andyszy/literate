@@ -338,7 +338,60 @@ it must stay in `tools/sync-upstream`'s `--exclude` list.
   the confirmation comes back byte-identical the handler returns early rather
   than resetting the cursor under someone who has started arrowing around.
 
+## The omnibox index
+
+`literate-workspace-namer --index-omnibox` writes
+`~/.local/state/literate/omnibox-index.json`: past Claude Code conversations
+plus Chrome history, for a UI to search over. Unlike everything else in this
+file it makes **no model call** and is pure local indexing, so it can run far
+more often than a naming pass.
+
+- Conversations come from `~/.claude/projects/<slug>/<sessionId>.jsonl`. The
+  label is whatever the transcript's own `{"type":"ai-title",...}` record
+  says -- a transcript with none is skipped rather than given an invented
+  name. `scan_transcript()` reads every line once (it needs the line count
+  anyway, as a cheap stand-in for message count) but only ever calls
+  `json.loads` on a line that contains the literal substring `"ai-title"`,
+  so a multi-megabyte transcript costs one linear byte scan, not one JSON
+  parse per line. A retitle mid-session can emit the record more than once;
+  the last one wins.
+- `decode_project_slug()` reverses the directory name Claude Code stores
+  transcripts under (e.g. `-home-andy` for `/home/andy`) by replacing "/"
+  with "-". That is lossy to invert on its own: a scratchpad directory
+  embeds a session id, which already contains "-", so
+  `-tmp-claude-1001--home-andy-<uuid>-scratchpad` looks identical to a path
+  with more slashes once encoded. Rather than guess at a split, it only
+  trusts a decode that resolves to a directory that actually exists on
+  disk; anything else falls back to `$HOME`. This is why a scratchpad
+  session's `project` in the index is just `$HOME`, not its real (and
+  unrecoverable) working directory.
+- Chrome history comes straight from `~/.config/google-chrome/Default/History`
+  -- the live sqlite file, never a copy -- opened with the URI form
+  `file:<path>?immutable=1`. That tells sqlite the file won't change under
+  it and to skip its normal locking, which is what makes it safe to open
+  read-only while Chrome itself has the file open (verified: a few ms, no
+  lock contention). **Never open this file without `immutable=1`, and never
+  read-write** -- it is Chrome's live database, not this plugin's.
+  `last_visit_time` is microseconds since 1601-01-01 (`webkit_to_unix()`
+  converts); getting that wrong silently puts every timestamp 369 years off
+  rather than erroring, so it's worth spot-checking a real row's date after
+  touching this.
+- Both sources are capped (`OMNIBOX_CONV_LIMIT`, `OMNIBOX_HISTORY_LIMIT`) so
+  the JSON stays small enough for a UI to hold in memory and filter locally.
+- The daemon also rebuilds the index opportunistically, the same shape as
+  `maybe_precompute_triage()`: `run_pass()` calls
+  `maybe_refresh_omnibox_index()` after every settled naming pass, which is
+  guarded by its own monotonic floor (`OMNIBOX_MIN_INTERVAL`) and a
+  stat-only change check (`_omnibox_changed()` -- Chrome's History file
+  mtime, or any transcript newer than the index) so a quiet desktop costs a
+  handful of `stat()` calls, not a rescan. Set `omnibox_index: false` to
+  turn this off; `--index-omnibox` still works standalone either way.
+
 ## Privacy
 
 Window titles for every workspace go to the model. Keep `ignore_classes` and
 the `local` backend working; they are the answer when someone asks.
+
+The omnibox index goes further than any of the above: it reads all of
+Chrome's browsing history and every past Claude Code conversation's title,
+not just what's open right now. `omnibox_index: false` is the off switch.
