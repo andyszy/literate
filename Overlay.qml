@@ -510,14 +510,12 @@ Item {
     Math.round(panel.height * 0.46), panel.height - Style.gapsOut * 4)
   // ...and it sits ABOVE centre. Results grow downward from the input, so a
   // vertically centred box puts the input at the middle of the screen and the
-  // answers below the eye. A quarter of the way down keeps the thing you type
-  // into at eye level and leaves the growth room underneath it -- again, the
-  // reason Spotlight sits where it does.
-  // 20% of the screen height, chosen against the 46% card above it: a top
-  // edge measured without the height is meaningless, and the obvious-looking
-  // 24% put a half-screen card exactly at dead centre. This puts the input at
-  // ~24% and the card's own centre at 43%, which is the "just north of
-  // centred" Spotlight sits at.
+  // answers below the eye. A fifth of the way down keeps the thing you type
+  // into at eye level and leaves the growth room underneath it, which is the
+  // reason Spotlight sits where it does. The fraction only means anything
+  // against the height above: the obvious-looking 24% put a half-screen card
+  // at dead centre. This puts the input at ~24% and the card's own centre at
+  // 43%.
   readonly property real triageTopFraction: 0.20
   property int cardWidth: root.triageMode ? root.triageCardWidth : root.workspaceCardWidth
   property int cardHeight: root.triageMode ? root.triageCardHeight : root.workspaceCardHeight
