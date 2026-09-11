@@ -451,26 +451,64 @@ more often than a naming pass.
   disk; anything else falls back to `$HOME`. This is why a scratchpad
   session's `project` in the index is just `$HOME`, not its real (and
   unrecoverable) working directory.
-- Chrome history comes straight from `~/.config/google-chrome/Default/History`
-  -- the live sqlite file, never a copy -- opened with the URI form
-  `file:<path>?immutable=1`. That tells sqlite the file won't change under
-  it and to skip its normal locking, which is what makes it safe to open
-  read-only while Chrome itself has the file open (verified: a few ms, no
-  lock contention). **Never open this file without `immutable=1`, and never
-  read-write** -- it is Chrome's live database, not this plugin's.
+- Chrome history comes straight from the live sqlite files, never a copy,
+  opened with the URI form `file:<path>?immutable=1` (`sqlite_immutable()`).
+  That tells sqlite the file won't change under it and to skip its normal
+  locking, which is what makes it safe to open read-only while Chrome itself
+  has the file open (verified: a few ms, no lock contention). **Never open
+  these without `immutable=1`, and never read-write** -- they are Chrome's
+  live databases, not this plugin's. The path is percent-encoded first,
+  because a URI is not a filename and `Profile 1` has a space in it.
   `last_visit_time` is microseconds since 1601-01-01 (`webkit_to_unix()`
   converts); getting that wrong silently puts every timestamp 369 years off
   rather than erroring, so it's worth spot-checking a real row's date after
   touching this.
+
+## `Default` is one Chrome profile, never the only one
+
+Sign a second Google account into Chrome and it gets its own directory beside
+`Default` -- `Profile 1`, `Profile 2`, with holes where a deleted profile used
+to be -- holding its own `History` and `Favicons`. Anything that hardcodes
+`Default` quietly indexes one account and pretends the other does not exist.
+
+- `chrome_profile_dirs()` enumerates them from `profile.info_cache` in
+  `~/.config/google-chrome/Local State`. That file is the only place a
+  profile's *human* name lives: the directory is `Profile 1`, the person
+  calls it `tradewinds.school`. It is 14 KB, so reading it per pass is free.
+  If it is missing or unparseable, fall back to globbing `*/History` -- the
+  directory name then has to stand in for both.
+- Every history row carries `profile` (the directory, the stable key) and
+  `profileName` (what to show someone). **Rows are never merged across
+  profiles**, even for the same URL: summing two accounts' visit counts
+  invents a rank neither earned, and one row can only carry one profile tag,
+  which throws away the one thing the person keeps two profiles to keep apart.
+- The cap is spent floor-first (`OMNIBOX_HISTORY_PROFILE_FLOOR`): each profile
+  takes its own best rows up to the floor, then the rest of the budget goes on
+  global rank. Without it the old profile (27 MB of History here) sweeps all
+  2000 rows and the new one (164 KB) is simply absent, which reads as "search
+  is broken for my work account" rather than as ranking. A profile with fewer
+  rows than the floor hands the remainder back, so one profile behaves exactly
+  as it did before.
+- `hidden = 1` marks a URL Chrome won't autocomplete -- redirect and subframe
+  noise in a profile with real traffic. It is *also* what a freshly signed-in
+  profile looks like when its history arrived over sync and nothing has been
+  visited locally yet: this machine's second profile is 15 rows, all hidden,
+  with an empty `visits` table. So hidden rows are a top-up used only to reach
+  the floor, never to pad a profile that has plenty of its own.
+- `chrome_profiles` (config) restricts the set by directory name. Empty means
+  all of them. It is the answer to "don't put my work history in my personal
+  search box", one step short of `omnibox_index: false`.
 - Both sources are capped (`OMNIBOX_CONV_LIMIT`, `OMNIBOX_HISTORY_LIMIT`) so
   the JSON stays small enough for a UI to hold in memory and filter locally.
 - The daemon also rebuilds the index opportunistically, the same shape as
   `maybe_precompute_triage()`: `run_pass()` calls
   `maybe_refresh_omnibox_index()` after every settled naming pass, which is
   guarded by its own monotonic floor (`OMNIBOX_MIN_INTERVAL`) and a
-  stat-only change check (`_omnibox_changed()` -- Chrome's History file
-  mtime, or any transcript newer than the index) so a quiet desktop costs a
-  handful of `stat()` calls, not a rescan. Set `omnibox_index: false` to
+  near-stat-only change check (`_omnibox_changed()` -- *every* indexed
+  profile's History mtime, or any transcript newer than the index) so a quiet
+  desktop costs a handful of `stat()` calls plus one small JSON read, not a
+  rescan. Watching only the profile in front of you leaves the other one's
+  history stale until something unrelated triggers a rebuild. Set `omnibox_index: false` to
   turn this off; `--index-omnibox` still works standalone either way.
 
 ## Privacy

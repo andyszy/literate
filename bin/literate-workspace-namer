@@ -88,9 +88,22 @@ CHROME_CLASSES = {"google-chrome", "google-chrome-beta", "google-chrome-unstable
 # both. No model call, so it can run far more often than a naming pass.
 OMNIBOX_INDEX_PATH = STATE_DIR / "omnibox-index.json"
 CLAUDE_PROJECTS_DIR = HOME / ".claude/projects"
-CHROME_HISTORY_PATH = HOME / ".config/google-chrome/Default/History"
+# Chrome keeps one directory per signed-in profile under here, each with its
+# own History and Favicons database. "Default" is only the *first* profile,
+# never the only one, and the directory names of the rest ("Profile 1", ...)
+# are not guessable: deleting a profile leaves a hole in the numbering. Chrome's
+# own registry of them is profile.info_cache in Local State, which is also the
+# only place a profile's human name ("tradewinds.school") is written down.
+CHROME_DIR = HOME / ".config/google-chrome"
+CHROME_LOCAL_STATE = CHROME_DIR / "Local State"
 OMNIBOX_CONV_LIMIT = 200
 OMNIBOX_HISTORY_LIMIT = 2000
+# ...of which every profile is guaranteed its own best rows before the rest of
+# the budget is handed out on global rank. Without a floor, one profile that
+# has been in use for years (27 MB of History here) sweeps the whole cap and a
+# profile signed in last week (164 KB) is simply not in the index -- which
+# reads as "search is broken for my work account", not as "ranking".
+OMNIBOX_HISTORY_PROFILE_FLOOR = 200
 # Chrome/WebKit timestamps are microseconds since 1601-01-01, not the unix
 # epoch. This is the gap between the two epochs, in seconds.
 WEBKIT_EPOCH_DELTA = 11644473600
@@ -141,6 +154,12 @@ DEFAULTS = {
     # transcript's title, which is more than naming needs -- an off switch
     # for anyone who doesn't want that.
     "omnibox_index": True,
+    # Which Chrome profiles the omnibox index reads, by *directory* name
+    # ("Default", "Profile 1"). Empty = every profile Chrome knows about.
+    # Signing a second profile in should not silently pour a work account's
+    # browsing history into a personal search box, so this is the narrowing
+    # switch for that, one step short of omnibox_index: false.
+    "chrome_profiles": [],
 }
 
 # Almost every GUI app appends its own name to the title. Left in, the model
@@ -1036,43 +1055,108 @@ def webkit_to_unix(webkit_time):
     return int(webkit_time / 1_000_000 - WEBKIT_EPOCH_DELTA)
 
 
-def build_history(limit=OMNIBOX_HISTORY_LIMIT):
-    """Chrome's History database, ranked by a blend of recency and visit
-    count and capped at `limit`. Missing/unreadable DB (Chrome not
-    installed, profile not named Default, ...) -- or any other failure --
-    yields [] rather than raising; the omnibox is still useful with half its
-    data missing, so a caller must never crash over this."""
-    if not CHROME_HISTORY_PATH.exists():
-        return []
+def chrome_profile_dirs(selected=None):
+    """(directory, human name) for every Chrome profile worth indexing.
+
+    Chrome's own registry is `profile.info_cache` in `Local State`, and it is
+    the only place a profile's human name lives: the directory is "Profile 1",
+    the person calls it "tradewinds.school". When that file is missing or
+    unparseable (a Chrome that has never run, a format change) fall back to the
+    one thing that is structural -- a directory with a History database in it.
+    The directory name is then all there is, so it stands in for both.
+
+    `selected` is the chrome_profiles config key: directory names to restrict
+    to. Empty or None means every profile Chrome knows about.
+    """
+    local_state = load_json(CHROME_LOCAL_STATE, {})
+    cache = (local_state.get("profile", {}) or {}).get("info_cache") \
+        if isinstance(local_state, dict) else None
+    found = []
+    if isinstance(cache, dict) and cache:
+        for directory, meta in cache.items():
+            name = str(meta.get("name") or "").strip() if isinstance(meta, dict) else ""
+            found.append((str(directory), name or str(directory)))
+    else:
+        log("omnibox: no readable profile.info_cache; globbing for History files")
+        found = [(path.parent.name, path.parent.name)
+                 for path in sorted(CHROME_DIR.glob("*/History"))]
+    # A profile listed in info_cache but never opened has no History database
+    # yet; asking sqlite about it would log a failure on every single pass.
+    found = [(d, n) for d, n in found if (CHROME_DIR / d / "History").exists()]
+    if selected:
+        wanted = {str(s) for s in selected}
+        found = [(d, n) for d, n in found if d in wanted]
+    return found
+
+
+def sqlite_immutable(path):
+    """Open one of Chrome's live sqlite databases read-only.
+
+    "immutable=1" tells sqlite the file will not change underneath it and to
+    skip its normal locking, which is what makes it safe to open while Chrome
+    itself has the file open (verified: a few ms, no lock contention).
+    Read-only by construction -- no ATTACH, no journal, nothing that could
+    write back to Chrome's database. **Never open these without immutable=1,
+    and never read-write.**
+
+    The path is percent-encoded because this is a URI and not a filename, and
+    a profile directory has a space in it ("Profile 1").
+    """
+    import sqlite3
+    from urllib.parse import quote
+    return sqlite3.connect(f"file:{quote(str(path))}?immutable=1", uri=True)
+
+
+def _history_rows(con, limit, hidden):
+    return con.execute(
+        "SELECT url, title, visit_count, last_visit_time FROM urls "
+        f"WHERE hidden = {1 if hidden else 0} AND title != '' "
+        "AND (url LIKE 'http://%' OR url LIKE 'https://%') "
+        "ORDER BY last_visit_time DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def build_profile_history(directory, profile_name, oversample, floor, now):
+    """[(score, entry), ...] for one Chrome profile, best first.
+
+    Any failure yields [] rather than raising: a database that is missing or
+    unreadable (a profile deleted between enumeration and now) must cost the
+    other profiles nothing, and the omnibox is still useful with half its data
+    missing.
+
+    `hidden = 1` marks a URL Chrome will not autocomplete -- reached only
+    through a redirect or a subframe, which is noise in a profile with real
+    traffic. It is also, though, exactly what a freshly signed-in profile
+    looks like when its history arrived over sync and nothing has been visited
+    locally yet: this machine's second profile is 15 rows, every one hidden,
+    with an empty visits table. So hidden rows are a *top-up* -- used only to
+    bring a profile up to its floor, never to pad one that has plenty of its
+    own.
+    """
+    db = CHROME_DIR / directory / "History"
     try:
-        import sqlite3
-        # "immutable=1" tells sqlite the file will not change underneath it
-        # and to skip its normal locking -- verified to open in a few ms with
-        # no lock contention even while Chrome is running. Read-only by
-        # construction: there is no ATTACH, no journal, nothing that could
-        # write back to Chrome's live database.
-        con = sqlite3.connect(f"file:{CHROME_HISTORY_PATH}?immutable=1", uri=True)
+        con = sqlite_immutable(db)
         try:
-            rows = con.execute(
-                "SELECT url, title, visit_count, last_visit_time FROM urls "
-                "WHERE hidden = 0 AND title != '' "
-                "AND (url LIKE 'http://%' OR url LIKE 'https://%') "
-                "ORDER BY last_visit_time DESC LIMIT ?",
-                (limit * 4,),  # oversample before the recency/visits blend re-ranks
-            ).fetchall()
+            # Oversample before the recency/visits blend re-ranks.
+            rows = _history_rows(con, oversample, hidden=False)
+            if len(rows) < floor:
+                rows += _history_rows(con, floor - len(rows), hidden=True)
         finally:
             con.close()
     except Exception as e:
-        log("omnibox: chrome history unavailable:", e)
+        log(f"omnibox: chrome history unavailable for {directory!r}:", e)
         return []
 
-    now = time.time()
-    entries = []
+    scored = []
     for url, title, visits, last_visit in rows:
         domain = registrable_domain(url)
         if not domain:
             continue
-        entries.append({
+        visits = visits or 0
+        last = webkit_to_unix(last_visit) if last_visit else 0
+        age_days = (now - last) / 86400 if last else 3650
+        scored.append((visits / (1 + max(0.0, age_days)), {
             "title": title,
             "url": url,
             "domain": domain,
@@ -1080,23 +1164,67 @@ def build_history(limit=OMNIBOX_HISTORY_LIMIT):
             # through, so a Gmail window and a Gmail history row are labelled
             # "Gmail" by one code path and cannot drift apart.
             "app": site_name(domain),
-            "visits": visits or 0,
-            "lastVisit": webkit_to_unix(last_visit) if last_visit else 0,
-        })
+            "visits": visits,
+            "lastVisit": last,
+            # Which account this row came from: the directory is the stable key
+            # a config or a UI filter uses, the name is what the person calls
+            # it. Rows are never merged across profiles, so both always name
+            # exactly one account.
+            "profile": directory,
+            "profileName": profile_name,
+        }))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
 
-    def score(e):
-        age_days = (now - e["lastVisit"]) / 86400 if e["lastVisit"] else 3650
-        return e["visits"] / (1 + max(0.0, age_days))
 
-    entries.sort(key=score, reverse=True)
-    return entries[:limit]
+def build_history(limit=OMNIBOX_HISTORY_LIMIT, profiles=None,
+                  floor=OMNIBOX_HISTORY_PROFILE_FLOOR):
+    """Every selected Chrome profile's History database, merged and ranked by
+    the same blend of recency and visit count as before, capped at `limit`.
+
+    A URL visited from two profiles stays **two rows**. Summing their visit
+    counts would invent a rank neither account earned, and one row can only
+    carry one profile tag, so the UI could no longer say which account a hit
+    belongs to -- which is the whole reason someone runs two profiles. A work
+    Gmail thread and a personal one are different pages that merely share a
+    URL shape.
+
+    The cap is spent floor-first: every profile takes its own best rows up to
+    `floor`, then what is left of the budget goes to the highest-scoring rows
+    from anywhere. A profile with fewer rows than the floor hands the
+    remainder back, and a single-profile machine gets exactly the old
+    behaviour.
+    """
+    profs = chrome_profile_dirs(profiles)
+    if not profs:
+        return []
+    now = time.time()
+    per_profile = [rows for rows in
+                   (build_profile_history(d, n, limit * 4, floor, now)
+                    for d, n in profs)
+                   if rows]
+    if not per_profile:
+        return []
+    # Never promise more floor than the cap can hold: with more profiles than
+    # limit/floor, every profile gets an equal smaller share, rather than the
+    # last ones enumerated being truncated away again at the end.
+    share = limit if len(per_profile) == 1 \
+        else min(floor, max(1, limit // len(per_profile)))
+    kept, pool = [], []
+    for rows in per_profile:
+        kept.extend(rows[:share])
+        pool.extend(rows[share:])
+    pool.sort(key=lambda pair: pair[0], reverse=True)
+    kept.extend(pool[:max(0, limit - len(kept))])
+    kept.sort(key=lambda pair: pair[0], reverse=True)
+    return [entry for _score, entry in kept[:limit]]
 
 
-def build_omnibox_index():
+def build_omnibox_index(profiles=None):
     return {
         "updatedAt": int(time.time()),
         "conversations": build_conversations(),
-        "history": build_history(),
+        "history": build_history(profiles=profiles),
     }
 
 
@@ -1809,15 +1937,23 @@ class Namer:
     # --------------------------------------------------------------- omnibox
 
     def _omnibox_changed(self):
-        """Stat-only check (no file content read) for whether a rebuild is
-        worth its cost: Chrome's History file moved since the last build, or
-        some transcript is newer than the index we last wrote. Runs every
-        settled pass once the min-interval floor clears, so it has to stay
-        cheap even though the rebuild it's guarding is not."""
-        try:
-            history_mtime = CHROME_HISTORY_PATH.stat().st_mtime
-        except OSError:
-            history_mtime = None
+        """Near-stat-only check for whether a rebuild is worth its cost: any
+        indexed profile's History file moved since the last build, or some
+        transcript is newer than the index we last wrote. Runs every settled
+        pass once the min-interval floor clears, so it has to stay cheap even
+        though the rebuild it's guarding is not -- which is why this watches
+        every profile rather than only the one that happens to be in front of
+        you. The one file it does read is Local State (14 KB), to learn what
+        the profiles even are; browsing in *either* account is a reason to
+        reindex, and the alternative is a second profile whose history goes
+        stale until something else triggers a rebuild.
+        """
+        history_mtime = {}
+        for directory, _name in chrome_profile_dirs(self.cfg.get("chrome_profiles")):
+            try:
+                history_mtime[directory] = (CHROME_DIR / directory / "History").stat().st_mtime
+            except OSError:
+                pass  # vanished mid-check; a later pass will see it or not
         moved = history_mtime != self.omnibox_history_mtime
         self.omnibox_history_mtime = history_mtime
         if moved:
@@ -1853,7 +1989,7 @@ class Namer:
         try:
             self.omnibox_at = now
             t0 = time.time()
-            payload = build_omnibox_index()
+            payload = build_omnibox_index(self.cfg.get("chrome_profiles"))
             write_atomic(OMNIBOX_INDEX_PATH, payload)
             log(f"omnibox index rebuilt: {len(payload['conversations'])} conversations, "
                 f"{len(payload['history'])} history rows in {time.time() - t0:.2f}s")
@@ -2065,13 +2201,17 @@ if __name__ == "__main__":
         # just from the daemon's own opportunistic refresh.
         t0 = time.time()
         try:
-            payload = build_omnibox_index()
+            payload = build_omnibox_index(namer.cfg.get("chrome_profiles"))
             write_atomic(OMNIBOX_INDEX_PATH, payload)
         except Exception as e:  # a bug here must still exit clean, never a traceback
             log("--index-omnibox failed:", e)
             sys.exit(1)
+        per_profile = Counter(row.get("profileName") or row.get("profile")
+                              for row in payload["history"])
         log(f"omnibox index: {len(payload['conversations'])} conversations, "
-            f"{len(payload['history'])} history rows in {time.time() - t0:.2f}s")
+            f"{len(payload['history'])} history rows "
+            f"({', '.join(f'{n} {p}' for p, n in per_profile.most_common())}) "
+            f"in {time.time() - t0:.2f}s")
         sys.exit(0)
     else:
         namer.listen_forever()
