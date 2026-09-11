@@ -1353,6 +1353,68 @@ def build_history(limit=OMNIBOX_HISTORY_LIMIT, profiles=None,
     return [entry for _score, entry in kept[:limit]]
 
 
+# Where the "Search the web for ..." action goes when Chrome has not been asked
+# to use anything else. Never hardcoded *over* the user's own choice -- see
+# chrome_search_engine() -- only under it.
+GOOGLE_SEARCH = {"name": "Google", "template": "https://www.google.com/search?q={searchTerms}"}
+# Chrome's search templates are full of its own expansions: {searchTerms} is the
+# only one anybody outside Chrome can honour.
+RE_SEARCH_PLACEHOLDER = re.compile(r"\{[^}]*\}")
+
+
+def clean_search_template(raw):
+    """A Chrome search template reduced to something a plain launcher can use.
+
+    Chrome's stored Google template is
+    `{google:baseURL}search?q={searchTerms}&{google:RLZ}...ie={inputEncoding}`:
+    a dozen expansions only the browser can fill in. Everything but
+    {searchTerms} is substituted where there is an honest answer ({google:baseURL},
+    {inputEncoding}) and otherwise dropped, whole query parameter and all, so
+    the result cannot carry a literal "{google:RLZ}" into a real request.
+    Returns "" if what is left is not a usable template.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    text = text.replace("{google:baseURL}", "https://www.google.com/")
+    text = text.replace("{inputEncoding}", "UTF-8")
+    head, _, query = text.partition("?")
+    if RE_SEARCH_PLACEHOLDER.search(head):
+        return ""
+    kept = [part for part in query.split("&")
+            if part and "{searchTerms}" in part] \
+        + [part for part in query.split("&")
+           if part and "{searchTerms}" not in part
+           and not RE_SEARCH_PLACEHOLDER.search(part) and "=" in part]
+    template = head + ("?" + "&".join(kept) if kept else "")
+    if "{searchTerms}" not in template or not template.startswith(("http://", "https://")):
+        return ""
+    return template
+
+
+def chrome_search_engine(directory):
+    """{"name", "template"} for one profile's default search engine.
+
+    Somebody who has switched Chrome to DuckDuckGo means it, and an omnibox
+    that silently searched Google instead would be lying about being their
+    address bar. Chrome writes the chosen engine into the profile's
+    `Preferences` under default_search_provider_data; a profile that has never
+    been switched has that key empty and simply uses the prepopulated default
+    for its country, which is where the Google fallback comes from (verified
+    against this machine: the key is `{}`, and the Google row in `Web Data`
+    still carries the unexpanded {google:*} template).
+    """
+    prefs = load_json(CHROME_DIR / directory / "Preferences", {})
+    data = prefs.get("default_search_provider_data") if isinstance(prefs, dict) else None
+    chosen = (data or {}).get("template_url_data") if isinstance(data, dict) else None
+    if isinstance(chosen, dict):
+        template = clean_search_template(chosen.get("url"))
+        if template:
+            return {"name": str(chosen.get("short_name") or "").strip() or "Search",
+                    "template": template}
+    return dict(GOOGLE_SEARCH)
+
+
 def _icon_rank(width):
     """Sort key for competing bitmaps of one site's favicon: bigger wins up to
     FAVICON_MAX_WIDTH, and past that smaller wins."""
@@ -1460,10 +1522,16 @@ def build_omnibox_index(profiles=None):
         attach_favicons(history, profiles)
     except Exception as e:  # decoration: never lose an index over an icon
         log("omnibox: favicons failed:", e)
+    known = chrome_profile_dirs(profiles)
     return {
         "updatedAt": int(time.time()),
         "conversations": build_conversations(),
         "history": history,
+        # The UI's fallback action ("search the web for what you typed") has to
+        # go somewhere, and with no Chrome address bar left there is no second
+        # place to correct it. So it ships in the index, read from Chrome
+        # itself rather than assumed.
+        "search": chrome_search_engine(known[0][0]) if known else dict(GOOGLE_SEARCH),
     }
 
 

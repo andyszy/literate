@@ -685,9 +685,25 @@ its own chord on SUPER+SHIFT+SLASH while the two are being compared.
   somewhere else entirely, silently. Proven against a desktop with workspaces
   1, 2, 3 and 5.
 - **Focus is a region, not just an index.** `focusRegion` says whether Enter
-  belongs to the shelf (go to that workspace) or the panel (act on that row).
-  Without it, hovering board 3 and pressing Enter focused the panel's first
-  row, which was a window on workspace 1.
+  belongs to the shelf (go to that workspace), the pinned query row, or the
+  panel (act on that row). Without it, hovering board 3 and pressing Enter
+  focused the panel's first row, which was a window on workspace 1.
+- **The typed query is always an action.** With Chrome's own address bar gone
+  there is no second place to correct a miss, so every non-empty query gets a
+  row: "Open <url>" when `Omnibox.looksLikeUrl()` recognises a location (a
+  scheme, a host with a port, an IP, a bare domain whose last label is
+  TLD-shaped -- which is what keeps "3.5" a search), else "Search the web for
+  <query>" through the engine the daemon read out of Chrome's own
+  `Preferences`. It is **pinned under the query line, not sorted into the
+  list**: a last row can be forty rows down a scroll, and a first row would
+  mean typing "gm" and pressing Enter searched the web instead of opening
+  gmail.com. Pinned, it is always visible, one arrow key from the cursor's
+  home, and Enter still belongs to the best result -- where Chrome puts its own
+  default suggestion too. A query that is *already* a URL is unambiguous, so
+  that one case takes the cursor on arrival. Read `activeRegion`, never
+  `focusRegion`, when acting or drawing: a query with no matches leaves the
+  panel pointing at nothing, and Enter doing nothing is the state this exists
+  to abolish.
 - `MouseArea.onPositionChanged` fires whenever the pointer moves **relative to
   the item**, which includes an item sliding under a stationary pointer. That
   is how a re-created panel row stole focus back the instant a board was
