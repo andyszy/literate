@@ -5,10 +5,11 @@ OpenAI-compatible `/v1/chat/completions`. This document is the other half:
 what to point it at, and whether that is a good idea.
 
 **Verdict up front: marginal, and not today's default.** A 3B model on this
-machine names *one changed workspace* about as well as Claude Haiku, and only
-fractionally slower than it -- 1.17 s against 0.86 s, behind a 3-second
-debounce. It falls apart on the wide prompts — naming ten workspaces at once,
-and `--triage`. The numbers are below; make your own call.
+machine names *one changed workspace* about as well as Claude Haiku and only
+fractionally slower — 1.17 s against 0.86 s, behind a debounce of 3 s. It
+falls apart on the wide prompts: naming ten workspaces at once, and
+`--triage`. Most of that turns out to be the repo's own prompt rather than the
+model, which is the most useful finding here and is written up below.
 
 ## What is installed
 
@@ -23,6 +24,7 @@ through `pacman`.
 | CMake 3.31.6 (Arch ships none here) | `~/.local/src/cmake-3.31.6-linux-aarch64` |
 | model | `~/.local/share/literate-models/Qwen2.5-3B-Instruct-Q4_K_M.gguf` |
 | service | `~/.config/systemd/user/llama-server.service` |
+| Vulkan build (built, benchmarked, unused) | `~/.local/src/llama.cpp/build-vk` |
 
 ## Building llama.cpp
 
@@ -60,19 +62,68 @@ the build-tree RPATH, `~/.local/lib` is not on the loader's search path, and
 every installed binary dies with `libllama-server-impl.so: cannot open shared
 object file`.
 
-### No GPU
+### The GPU works, and is the wrong choice anyway
 
-CPU only. The Asahi GPU is a real Vulkan device — probing `libvulkan` reports
-`Apple M1 Pro (G13S C0)`, Vulkan 1.4.354, with `shaderInt16`,
-`VK_KHR_16bit_storage`, `VK_KHR_shader_float16_int8` and
-`VK_EXT_subgroup_size_control` (no `VK_KHR_cooperative_matrix`, which
-llama.cpp does not require) — so a Vulkan backend is not obviously
-impossible. It was not built, for a reason that is decisive here: the Vulkan
-**headers** are not installed and `vulkan-headers` cannot be added without
-root. They can be unpacked from a tarball into `~/.local/src` like CMake was,
-so this is worth revisiting; it is a "not attempted", not a "does not work".
-Given that a 3B Q4 model already runs at 37 tok/s on the CPU cores and the
-bottleneck in daily use is prompt processing, the upside is likely small.
+This is worth writing down because the obvious assumption — "Asahi, so no GPU"
+— is wrong, and so is the next one.
+
+A Vulkan build *does* work on this machine, rootlessly. It needs two header
+sets Arch has not installed and that cannot be added without root, both of
+which unpack into `~/.local` exactly like CMake did:
+
+```sh
+cd ~/.local/src
+curl -LO https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.309.tar.gz
+curl -LO https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/vulkan-sdk-1.4.309.0.tar.gz
+# ...untar both; SPIRV-Headers needs an install step for its CMake config:
+cmake -B b -DCMAKE_INSTALL_PREFIX=$HOME/.local && cmake --install b
+
+cd ~/.local/src/llama.cpp
+cmake -B build-vk -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=$HOME/.local \
+  -DGGML_VULKAN=ON -DGGML_NATIVE=ON \
+  -DVulkan_INCLUDE_DIR=$HOME/.local/src/Vulkan-Headers-1.4.309/include \
+  -DVulkan_GLSLC_EXECUTABLE=/usr/bin/glslc \
+  -DCMAKE_CXX_FLAGS="-I$HOME/.local/include"
+```
+
+That last `-I` is needed or `ggml-vulkan.cpp` cannot find
+`spirv/unified1/spirv.hpp`. The build compiles about 960 shaders and takes
+roughly half an hour on this machine.
+
+It runs. `llama-bench` sees the real GPU:
+
+```
+ggml_vulkan: 0 = Apple M1 Pro (G13S C0) (Honeykrisp) | uma: 1 | fp16: 1
+             | warp size: 32 | int dot: 0 | matrix cores: none
+```
+
+And then it loses:
+
+| Backend | prompt (pp512) | generation (tg64) |
+|---|---|---|
+| CPU, 6 threads | 144 tok/s | **43 tok/s** |
+| Vulkan, all layers on GPU | **189 tok/s** | 26 tok/s |
+
+The GPU is 31% faster at chewing through a prompt and 39% *slower* at
+producing tokens — no matrix cores, no integer dot product, and a unified
+memory bus it has to share. For this workload that settles it: the ~1050-token
+system prompt is identical on every call and the server's slot cache means it
+is processed once, ever, so prompt speed barely matters, while every reply is
+generation-bound. **The shipped service is the CPU build**, and `build-vk` is
+left in the tree as evidence rather than as something to switch to.
+
+Thread count was chosen the same way. The M1 Pro's two efficiency cores are a
+liability here:
+
+| Threads | pp512 | tg64 |
+|---|---|---|
+| 4 | 103 tok/s | 34 tok/s |
+| **6** | 144 tok/s | **43 tok/s** |
+| 8 | 147 tok/s | 32 tok/s |
+
+Hence `--threads 6` in the unit: all six performance cores, neither efficiency
+core.
 
 ## The model
 
@@ -115,7 +166,7 @@ alive anyway — the namer is bursty and would pay that load on every call.
 is identical on every call, and the server's slot cache reuses it verbatim
 (`f_sim_best = 1.000`), so only the handful of tokens describing the actual
 windows get processed. Without it every call would re-evaluate the whole
-prompt at ~110 tok/s, adding about ten seconds.
+prompt at ~144 tok/s, adding several seconds to every call.
 
 ## Switching the namer over
 
@@ -152,19 +203,30 @@ cache reuses the system prefix but never a whole reply. Local numbers are
 |---|---|---|
 | name 1 workspace | 0.86 s | **1.17 s** |
 | name 10 workspaces | 2.23 s | **5.94 s** |
-| `--suggest`, 7 windows | 1.5 s | 5.2 s |
-| `--triage`, 19 windows | 3.0 s | 5.5 s |
+| `--suggest`, 7 windows † | 1.5 s | 5.2 s |
+| `--triage`, 19 windows † | 3.0 s | 5.5 s |
 
-Generation runs at ~37 tok/s, prompt processing at ~110 tok/s, on six
+† single sample, not a median — these were run for output quality, not timing.
+
+Generation runs at ~43 tok/s, prompt processing at ~144 tok/s, on six
 threads. Single-workspace replies are short enough that the gap to Haiku is
 round-trip noise; the batch gap is generation-bound and scales with the
 number of workspaces. A call that misses the slot cache pays the full ~1050
-token prompt at 110 tok/s -- the 3.4 s and 8.5 s outliers in the samples
+token prompt at ~144 tok/s -- the 3.4 s and 8.5 s outliers in the samples
 above are those.
 
 The single-workspace figure is the one that matters. `run_pass()` only asks
 about workspaces whose window signature actually changed, which is almost
 always one, and the daemon already sits behind a 3-second debounce.
+
+**These figures assume an idle machine, and that assumption is the local
+backend's real weakness.** The same single-workspace call, issued while an
+eight-way `make` was saturating the CPU, took 8.4 s instead of 1.17 s — seven
+times worse, and the `Nice=10`/`CPUWeight=50` in the unit is what causes that:
+it protects the desktop by starving inference. An API call does not care what
+the machine is doing. So the moment you most want a workspace named — you just
+started a build and opened three terminals — is the moment the local model is
+slowest.
 
 ## Quality
 
@@ -213,9 +275,11 @@ the id the daemon actually asked for is sometimes missing entirely.
 
 Two experiments confirm it:
 
-- Renumbering the fixture's workspaces to 6..10 (same windows, ids that cannot
-  collide) makes the model answer correctly — including the workspaces it had
-  got wrong at ids 1..5.
+- Reversing the fixture's ids — same ten sets of windows, renumbered so that
+  what was workspace 2 becomes workspace 9 — moves the errors with the
+  *numbers*, not with the windows. The Gmail pair that came out "Lisbon Trip"
+  at id 2 comes out "Email" at id 9; everything that lands on an id above 5
+  is named correctly.
 - Renumbering the *examples* to `Workspace A` … `Workspace E`, changing
   nothing else, fixes it in place.
 
@@ -315,13 +379,17 @@ mid-token instead, which is not obviously better.
 **Marginal. Usable for the daemon's normal job, not for the wide prompts.**
 
 - Day-to-day naming, one changed workspace at a time, hidden behind a
-  3-second debounce: yes. Roughly Haiku quality, 0.3 s slower, free,
-  and the window titles never leave the machine — which for a feature that
-  reads every window title and Chrome URL is not a small thing.
-- `--suggest`: yes.
+  3-second debounce: yes — *after* the example ids are fixed. Roughly Haiku
+  quality, 0.3 s slower, free, and the window titles never leave the machine,
+  which for a feature that reads every window title and Chrome URL is not a
+  small thing. Before that fix it is a coin flip on workspaces 1–5: naming
+  those one at a time still produced the example block verbatim, and one
+  workspace came back as `??`.
+- `--suggest`: yes, unreservedly. Correct name, correct spin-out group,
+  correct window indices, no prompt contamination — its examples carry no ids.
 - `--triage`: no. Wrong enough to be worse than nothing.
 - Batch naming after a restart, when every workspace is pending at once:
-  degraded, and today actively broken by the example-id collision.
+  degraded even with the ids fixed, and badly broken without.
 
 If this is to become the default, in order of value for effort:
 
@@ -332,8 +400,9 @@ If this is to become the default, in order of value for effort:
    workspaces per call rather than all of them. Width is this model's real
    failure mode.
 3. **A bigger model for `--triage`**, or leave `--triage` on the API. A 7B at
-   Q4 would roughly double latency, which `--triage` can afford (it is an
-   explicit user action) and the daemon cannot.
+   Q4 should roughly double latency — extrapolated from this model's 43 tok/s,
+   not measured — which `--triage` can afford, being an explicit user action,
+   and the naming daemon cannot.
 
 Constrained decoding is not on that list. It is a correctness belt-and-braces
 measure, not a quality fix.
