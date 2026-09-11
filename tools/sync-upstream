@@ -64,6 +64,7 @@ rsync -a --delete \
   --exclude .gitignore \
   --exclude README.md \
   --exclude CLAUDE.md \
+  --exclude LOCAL-MODEL.md \
   --exclude LICENSE \
   --exclude tools \
   --exclude Workspaces.qml \
