@@ -327,6 +327,16 @@ it must stay in `tools/sync-upstream`'s `--exclude` list.
 - `run_pass()` gathers `_filtered_clients()` once and derives both the naming
   snapshot (`group_by_workspace()`) and the triage window list
   (`triage_windows()`) from it — the precompute costs no extra `hyprctl`.
+- `Triage.qml` does not even wait for that ~45 ms: it keeps its own `FileView`
+  on `triage.json`, and because `Overlay.qml` is `keepLoaded` the file is
+  already parsed before the key is ever pressed, so `open()` paints a full
+  grouping in its first frame and *then* runs `--triage` to confirm it. Which
+  is why `blocking` (nothing on screen yet) and `refreshing` (an answer in
+  flight over rows already drawn) are separate: only the first gets the
+  progress bar, the second gets " · refreshing…" in the header. A grouping
+  that is slightly stale beats a spinner over data we already have — and when
+  the confirmation comes back byte-identical the handler returns early rather
+  than resetting the cursor under someone who has started arrowing around.
 
 ## Privacy
 

@@ -43,6 +43,14 @@ Item {
   property var windows: []      // [{index, address, class, title, workspace}]
   property int cursor: 0        // position within selectableRows, not rows
 
+  // There is a real difference between "waiting with nothing to show" and
+  // "waiting on top of a grouping already on screen". The first earns a
+  // progress bar; the second must not get one -- a spinner over good-enough
+  // data is worse than the slightly stale data underneath it.
+  readonly property bool hasContent: root.categories.length > 0
+  readonly property bool blocking: root.loading && !root.hasContent
+  readonly property bool refreshing: root.loading && root.hasContent
+
   // Incremental search: plain substring, case-insensitive, matched against
   // category name / window class / window title independently. See
   // computeRows() below for how a query reshapes the grouped list.
@@ -59,13 +67,23 @@ Item {
   }
 
   function open() {
-    root.loading = true
     root.failed = false
     root.errorText = ""
-    root.categories = []
-    root.windows = []
     root.cursor = 0
     root.query = ""
+    // Paint the daemon's precomputed grouping in this frame rather than
+    // waiting on a process to tell us the same thing. If it is still current
+    // --triage confirms it in ~45ms and nothing moves; if the desktop has
+    // drifted, the fresh answer lands a second later and replaces it. Either
+    // way the view is useful immediately, which is the whole point.
+    if (root.cache) {
+      root.categories = root.cache.categories
+      root.windows = root.cache.windows
+    } else {
+      root.categories = []
+      root.windows = []
+    }
+    root.loading = true
     proc.command = [root.binPath, "--triage"]
     proc.running = true
     timeoutTimer.restart()
@@ -255,13 +273,25 @@ Item {
         root.loading = false
 
         if (data.error) {
+          // With a cached grouping already on screen this is a failed
+          // refresh, not a failed triage: say so quietly and leave the rows
+          // alone rather than replacing something useful with an error.
           root.failed = true
           root.errorText = String(data.error)
           return
         }
 
-        root.categories = Array.isArray(data.categories) ? data.categories : []
-        root.windows = Array.isArray(data.windows) ? data.windows : []
+        var cats = Array.isArray(data.categories) ? data.categories : []
+        var wins = Array.isArray(data.windows) ? data.windows : []
+        // A cache hit hands back exactly what open() already painted.
+        // Reassigning would be invisible; resetting the cursor and scroll
+        // position under someone who has started arrowing around would not.
+        if (JSON.stringify(cats) === JSON.stringify(root.categories)
+            && JSON.stringify(wins) === JSON.stringify(root.windows))
+          return
+
+        root.categories = cats
+        root.windows = wins
         root.cursor = 0
       }
     }
@@ -297,6 +327,33 @@ Item {
         if (proc.running) proc.running = false
       }
     }
+  }
+
+  // ------------------------------------------------------------ triage cache
+  //
+  // The daemon groups the desktop after every settled window-set change and
+  // writes the answer here (maybe_precompute_triage() in
+  // bin/literate-workspace-namer), atomically, exactly as it does
+  // workspaces.json. Overlay.qml is keepLoaded, so this FileView has parsed
+  // the file long before the triage key is ever pressed -- which is what lets
+  // open() draw a full grouping in its first frame.
+  //
+  // This is only what we draw while the answer is in flight. `--triage` hashes
+  // the live window set and stays the authority on what is actually open.
+  property var cache: null
+
+  FileView {
+    path: Quickshell.env("HOME") + "/.local/state/literate/triage.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      var d = null
+      try { d = JSON.parse(text()) } catch (e) { d = null }
+      root.cache = (d && Array.isArray(d.categories) && d.categories.length > 0
+                    && Array.isArray(d.windows)) ? d : null
+    }
+    onLoadFailed: root.cache = null
   }
 
   // Fire-and-forget action processes -- root.closeRequested() fires before
@@ -360,14 +417,16 @@ Item {
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      text: root.query.length > 0
+      // The " · refreshing…" tail is the whole of the drift hint: rows that
+      // are already readable do not deserve a bar drawn over the top of them.
+      text: (root.query.length > 0
         ? ("Search: " + root.query + "▮"
            + " · " + root.visibleWindowCount + (root.visibleWindowCount === 1 ? " window" : " windows")
            + " · " + root.visibleCategoryCount + (root.visibleCategoryCount === 1 ? " category" : " categories"))
         : ("Triage" + (root.windows.length > 0
             ? (" · " + root.windows.length + (root.windows.length === 1 ? " window" : " windows")
                + " · " + root.categories.length + (root.categories.length === 1 ? " category" : " categories"))
-            : ""))
+            : ""))) + (root.refreshing ? " · refreshing…" : "")
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.heading
@@ -381,14 +440,14 @@ Item {
     anchors.topMargin: height > 0 ? Style.spacing.md : 0
     anchors.left: parent.left
     anchors.right: parent.right
-    height: (root.loading || root.failed) ? Style.space(16) : 0
+    height: (root.blocking || root.failed) ? Style.space(16) : 0
     visible: height > 0
 
     // Real indeterminate progress: a filled rect sweeping the track on a
     // loop, matching Overlay.qml's --suggest progress bar.
     Rectangle {
       id: progressTrack
-      visible: root.loading
+      visible: root.blocking
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
@@ -405,7 +464,7 @@ Item {
         color: root.selectedText
 
         SequentialAnimation on x {
-          running: root.loading
+          running: root.blocking
           loops: Animation.Infinite
           NumberAnimation {
             from: -progressFill.width
@@ -423,7 +482,9 @@ Item {
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      text: "Couldn't triage: " + root.errorText
+      // Cached rows are still on screen when a refresh fails, so name what
+      // actually went wrong rather than implying the view is empty.
+      text: (root.hasContent ? "Couldn't refresh: " : "Couldn't triage: ") + root.errorText
       color: Color.urgent
       opacity: 0.85
       font.family: root.fontFamily
@@ -435,7 +496,7 @@ Item {
   Text {
     id: noMatches
     textFormat: Text.PlainText
-    visible: root.query.length > 0 && root.rows.length === 0 && !root.loading && !root.failed
+    visible: root.query.length > 0 && root.rows.length === 0 && !root.blocking && !root.failed
     anchors.top: status.bottom
     anchors.topMargin: Style.spacing.md
     anchors.left: parent.left
