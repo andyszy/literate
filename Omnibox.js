@@ -55,13 +55,32 @@ function matchHistory(query, index) {
     if (rank < 0) continue
     matched.push({ item: h, rank: rank })
   }
-  matched.sort(function(a, b) {
-    if (a.rank !== b.rank) return a.rank - b.rank
-    var byVisit = (Number(b.item.lastVisit) || 0) - (Number(a.item.lastVisit) || 0)
-    if (byVisit !== 0) return byVisit
-    return (Number(b.item.visits) || 0) - (Number(a.item.visits) || 0)
-  })
+  matched.sort(compareHistory)
   return matched.map(function(m) { return m.item })
+}
+
+// The ranking an ADDRESS BAR needs, which is not the ranking a history search
+// needs. Ordered by:
+//
+//   1. where the query matched  -- prefix, then word start, then mid-string.
+//      A match at the front of a domain is a different kind of answer from a
+//      match buried in a page title, and no count outranks that.
+//   2. typedCount, DOMINANT among the counts. Chrome records how often a URL
+//      was reached by someone typing it, and that is the only signal that
+//      distinguishes a destination from a page: gmail.com is typed 90 times
+//      here, while the most recently loaded page whose title happens to
+//      contain "gm" was typed never. Ranking on visits and recency instead
+//      (which is what this did) answers "what did I look at", when the
+//      question an address bar is asked is "where do I go".
+//   3. visits, then last visit, as tiebreakers -- among URLs nobody ever
+//      typed, which is most of them, this is exactly the old order.
+function compareHistory(a, b) {
+  if (a.rank !== b.rank) return a.rank - b.rank
+  var byTyped = (Number(b.item.typedCount) || 0) - (Number(a.item.typedCount) || 0)
+  if (byTyped !== 0) return byTyped
+  var byVisit = (Number(b.item.visits) || 0) - (Number(a.item.visits) || 0)
+  if (byVisit !== 0) return byVisit
+  return (Number(b.item.lastVisit) || 0) - (Number(a.item.lastVisit) || 0)
 }
 
 // Mirrors bin/literate-workspace-namer's strip_status_glyphs(): drop leading

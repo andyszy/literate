@@ -116,6 +116,11 @@ OMNIBOX_HISTORY_LIMIT = 2000
 # profile signed in last week (164 KB) is simply not in the index -- which
 # reads as "search is broken for my work account", not as "ranking".
 OMNIBOX_HISTORY_PROFILE_FLOOR = 200
+# Typed URLs are fetched per profile on top of the recency sample and never cut
+# by it. This is a sanity ceiling, not a budget: 379 URLs here carry a
+# typed_count at all, and a machine with more than this many has been typing
+# for a decade.
+OMNIBOX_TYPED_LIMIT = 1000
 # Chrome/WebKit timestamps are microseconds since 1601-01-01, not the unix
 # epoch. This is the gap between the two epochs, in seconds.
 WEBKIT_EPOCH_DELTA = 11644473600
@@ -1198,12 +1203,35 @@ def sqlite_immutable(path):
     return sqlite3.connect(f"file:{quote(str(path))}?immutable=1", uri=True)
 
 
+HISTORY_COLUMNS = ("SELECT url, title, visit_count, typed_count, last_visit_time "
+                   "FROM urls WHERE title != '' "
+                   "AND (url LIKE 'http://%' OR url LIKE 'https://%') ")
+
+
 def _history_rows(con, limit, hidden):
     return con.execute(
-        "SELECT url, title, visit_count, last_visit_time FROM urls "
-        f"WHERE hidden = {1 if hidden else 0} AND title != '' "
-        "AND (url LIKE 'http://%' OR url LIKE 'https://%') "
+        HISTORY_COLUMNS + f"AND hidden = {1 if hidden else 0} "
         "ORDER BY last_visit_time DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def _typed_rows(con, limit):
+    """The URLs this profile was reached by TYPING, most-typed first.
+
+    `typed_count` is Chrome's count of how often a URL was reached from the
+    address bar rather than by following a link, and it is the single signal
+    that makes "gm" mean gmail.com rather than whichever page mentioning "gm"
+    was loaded most recently. There are few of them -- 379 of 13,077 URLs on
+    this machine -- and they are not necessarily *recent*: a destination typed
+    every week for years still loses a sample ordered by last visit to an
+    afternoon of reading. So they are fetched separately and deliberately
+    escape the recency cut; a typed URL is the one row an address bar cannot
+    afford to have missing.
+    """
+    return con.execute(
+        HISTORY_COLUMNS + "AND typed_count > 0 AND hidden = 0 "
+        "ORDER BY typed_count DESC LIMIT ?",
         (limit,),
     ).fetchall()
 
@@ -1229,8 +1257,10 @@ def build_profile_history(directory, profile_name, oversample, floor, now):
     try:
         con = sqlite_immutable(db)
         try:
-            # Oversample before the recency/visits blend re-ranks.
-            rows = _history_rows(con, oversample, hidden=False)
+            # Every deliberately-typed destination first, unconditionally (see
+            # _typed_rows), then the recency sample the blend re-ranks.
+            rows = _typed_rows(con, OMNIBOX_TYPED_LIMIT)
+            rows += _history_rows(con, oversample, hidden=False)
             if len(rows) < floor:
                 rows += _history_rows(con, floor - len(rows), hidden=True)
         finally:
@@ -1239,15 +1269,23 @@ def build_profile_history(directory, profile_name, oversample, floor, now):
         log(f"omnibox: chrome history unavailable for {directory!r}:", e)
         return []
 
-    scored = []
-    for url, title, visits, last_visit in rows:
+    scored, seen = [], set()
+    for url, title, visits, typed, last_visit in rows:
+        if url in seen:  # a typed row also turns up in the recency sample
+            continue
+        seen.add(url)
         domain = registrable_domain(url)
         if not domain:
             continue
         visits = visits or 0
+        typed = typed or 0
         last = webkit_to_unix(last_visit) if last_visit else 0
         age_days = (now - last) / 86400 if last else 3650
-        scored.append((visits / (1 + max(0.0, age_days)), {
+        # Typed count leads the sort key rather than being folded into the
+        # blend, so no amount of recent link-following can push a typed
+        # destination out of the index. The blend still orders everything
+        # within one typed count, which for the vast majority is zero.
+        scored.append(((typed, visits / (1 + max(0.0, age_days))), {
             "title": title,
             "url": url,
             "domain": domain,
@@ -1256,6 +1294,9 @@ def build_profile_history(directory, profile_name, oversample, floor, now):
             # "Gmail" by one code path and cannot drift apart.
             "app": site_name(domain),
             "visits": visits,
+            # How often this URL was TYPED rather than followed. The omnibox's
+            # dominant ranking signal; see _typed_rows().
+            "typedCount": typed,
             "lastVisit": last,
             # Which account this row came from: the directory is the stable key
             # a config or a UI filter uses, the name is what the person calls
@@ -1270,8 +1311,9 @@ def build_profile_history(directory, profile_name, oversample, floor, now):
 
 def build_history(limit=OMNIBOX_HISTORY_LIMIT, profiles=None,
                   floor=OMNIBOX_HISTORY_PROFILE_FLOOR):
-    """Every selected Chrome profile's History database, merged and ranked by
-    the same blend of recency and visit count as before, capped at `limit`.
+    """Every selected Chrome profile's History database, merged and ranked
+    typed-destinations-first (see _typed_rows) with the recency/visits blend
+    ordering everything below them, capped at `limit`.
 
     A URL visited from two profiles stays **two rows**. Summing their visit
     counts would invent a rank neither account earned, and one row can only

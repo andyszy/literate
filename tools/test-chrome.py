@@ -44,7 +44,10 @@ namer.LOG_PATH = Path(_LOG.name)
 
 def make_history(path, rows):
     """A minimal stand-in for Chrome's History database. `rows` are
-    (url, title, visit_count, last_visit_webkit, hidden)."""
+    (url, title, visit_count, last_visit_webkit, hidden) with an optional
+    sixth element, typed_count -- left off, a row was never typed, which is
+    true of all but 379 of the 13,077 URLs on the machine this was written
+    on."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.unlink(missing_ok=True)  # rewriting a profile mid-test is a fresh DB
     con = sqlite3.connect(path)
@@ -52,8 +55,9 @@ def make_history(path, rows):
                 "title LONGVARCHAR, visit_count INTEGER DEFAULT 0, "
                 "typed_count INTEGER DEFAULT 0, last_visit_time INTEGER, "
                 "hidden INTEGER DEFAULT 0)")
-    con.executemany("INSERT INTO urls (url, title, visit_count, last_visit_time, hidden) "
-                    "VALUES (?, ?, ?, ?, ?)", rows)
+    con.executemany("INSERT INTO urls (url, title, visit_count, last_visit_time, hidden, "
+                    "typed_count) VALUES (?, ?, ?, ?, ?, ?)",
+                    [tuple(row) + (0,) * (6 - len(row)) for row in rows])
     con.commit()
     con.close()
 
@@ -252,6 +256,60 @@ class TestHistoryMerge(ChromeDirTest):
 
     def test_no_chrome_at_all_yields_no_rows(self):
         self.assertEqual(namer.build_history(), [])
+
+
+class TestTypedHistory(ChromeDirTest):
+    """typed_count -- how often a URL was reached by TYPING it -- is what turns
+    a history search into an address bar, so it has to reach the index intact
+    and it must not be something a recency sample can cut."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_local_state({"Default": {"name": "Andy"}})
+
+    def test_typed_count_reaches_the_row(self):
+        now = time.time()
+        make_history(self.chrome / "Default" / "History",
+                     [("https://gmail.com/", "Inbox", 98, webkit(now), 0, 90)])
+        rows = namer.build_history()
+        self.assertEqual(rows[0]["typedCount"], 90)
+
+    def test_a_url_nobody_typed_reports_zero_rather_than_nothing(self):
+        make_history(self.chrome / "Default" / "History",
+                     [("https://example.com/", "page", 3, webkit(time.time()), 0)])
+        self.assertEqual(namer.build_history()[0]["typedCount"], 0)
+
+    def test_a_typed_url_survives_a_recency_sample_that_excludes_it(self):
+        # The shape this exists for: an afternoon of link-following buries a
+        # destination typed every week for years. Ordered by last visit alone
+        # the typed row is not even a candidate.
+        now = time.time()
+        rows = self.rows(400, visits=2, when=now)
+        rows.append(("https://gmail.com/", "Inbox", 98, webkit(now - 86400 * 30), 0, 90))
+        make_history(self.chrome / "Default" / "History", rows)
+        kept = namer.build_history(limit=50, floor=10)
+        self.assertIn("https://gmail.com/", [r["url"] for r in kept])
+        self.assertEqual(kept[0]["url"], "https://gmail.com/",
+                         "the most-typed URL must outrank a fresh recency sample")
+
+    def test_typed_rows_are_ordered_by_typed_count_ahead_of_the_blend(self):
+        now = time.time()
+        make_history(self.chrome / "Default" / "History", [
+            ("https://news.google.com/", "Google News", 53, webkit(now), 0, 39),
+            ("https://busy.example/", "busy", 5000, webkit(now), 0, 0),
+            ("https://calendar.google.com/", "Calendar", 175, webkit(now), 0, 74),
+        ])
+        self.assertEqual([r["domain"] for r in namer.build_history()],
+                         ["calendar.google.com", "news.google.com", "busy.example"])
+
+    def test_a_typed_url_is_never_padded_in_from_the_hidden_pile(self):
+        # Hidden rows stay a floor top-up, typed or not: a redirect Chrome
+        # refuses to autocomplete is not a destination.
+        make_history(self.chrome / "Default" / "History",
+                     [("https://redirect.example/", "r", 1, webkit(time.time()), 1, 40)]
+                     + self.rows(30, visits=4))
+        kept = namer.build_history(limit=20, floor=0)
+        self.assertNotIn("https://redirect.example/", [r["url"] for r in kept])
 
 
 class TestFavicons(ChromeDirTest):
