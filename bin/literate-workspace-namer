@@ -14,6 +14,7 @@ an icon. Results land in a JSON file the bar widget watches.
   literate-workspace-namer --once          one pass over the live desktop
   literate-workspace-namer --test FIXTURE  name a fixture; print, write nothing
   literate-workspace-namer --suggest ID    one workspace, one model call; print JSON, write nothing
+  literate-workspace-namer --triage        every window, every workspace, one model call, grouped by activity
   literate-workspace-namer --pin ID NAME [ICON]  fix a workspace's name; the model skips it
   literate-workspace-namer --unpin ID            drop a pin; back to model-named
 """
@@ -321,6 +322,36 @@ def suggest_user_prompt(ws_arg, windows):
     lines = [f"  {i}: [{w['class']}] {w['title']}" if w["title"] else f"  {i}: [{w['class']}]"
              for i, w in enumerate(windows)]
     return f"Workspace {ws_arg}:\n" + "\n".join(lines) + "\n\nReply with the JSON object only."
+
+
+def triage_system_prompt():
+    """--triage: a different question again -- look at every window on every
+    workspace at once and group them by what the person is DOING, not by
+    which application happens to be open. Two terminals can be two different
+    tasks; a mail client and a browser tab about the same thread are one."""
+    return f"""You look at every window open across every workspace on a Linux desktop and sort them into a handful of groups by what the person is DOING right now -- never by which application is open.
+
+Each window is given as its index, its workspace number, its window class, and its title.
+
+Rules
+- Group by activity or topic, not by app: a mail client and a browser tab about the same thread belong together; two terminal sessions on unrelated projects are two different groups even though both are class "foot".
+- Every group needs a short name (1-3 words, same style as a workspace name) and one Phosphor icon, such as {" ".join(ICON_HINTS.split())}. Any Phosphor icon is allowed. Plain names only, no -fill or -bold variants.
+- Put each window's index in exactly one group's "indices" list. If a window genuinely fits nowhere, leave its index out of every group entirely -- it will be shown on its own, you do not need an "other" catch-all.
+- Prefer a handful of meaningful groups over one group per window or one per app.
+
+Reply with exactly one JSON object and nothing else, shaped like:
+
+{{"categories": [
+  {{"name": "Email", "icon": "envelope", "indices": [0, 3]}},
+  {{"name": "Lisbon Trip", "icon": "airplane", "indices": [1, 2]}}
+]}}"""
+
+
+def triage_user_prompt(windows):
+    lines = [f"  {w['index']}: (workspace {w['workspace']}) [{w['class']}] {w['title']}" if w["title"]
+             else f"  {w['index']}: (workspace {w['workspace']}) [{w['class']}]"
+             for w in windows]
+    return "Windows:\n" + "\n".join(lines) + "\n\nReply with the JSON object only."
 
 
 # -------------------------------------------------------------- chrome tabs
@@ -779,6 +810,65 @@ class Namer:
             "groups": groups,
         }, 0
 
+    # ---------------------------------------------------------------- triage
+
+    def triage(self):
+        """Every window on every real workspace, one model call, grouped by
+        what the person is doing rather than which app is open. Pure read
+        path like --suggest -- no cache, no state file, no daemon loop.
+        Returns (payload, exit_code)."""
+        try:
+            windows = [
+                {"index": i, "address": addr, "class": cls, "title": title, "workspace": str(ws)}
+                for i, (ws, cls, title, addr) in enumerate(self._filtered_clients())
+            ]
+        except Exception as e:
+            return {"error": f"hyprctl failed: {e}"[:200]}, 1
+        if not windows:
+            return {"categories": [], "windows": []}, 0
+
+        try:
+            raw = self.ask(triage_system_prompt(), triage_user_prompt(windows))
+            data = extract_json(raw)
+            if not isinstance(data, dict):
+                raise ValueError("model reply was not a JSON object")
+        except Exception as e:
+            return {"error": str(e)[:200]}, 1
+
+        # Trust nothing the model said: every index must name a real window,
+        # and once an index has landed in one category it cannot land in
+        # another -- a window must never appear twice.
+        valid_indices = set(range(len(windows)))
+        seen = set()
+        categories = []
+        for cat in data.get("categories") or []:
+            if not isinstance(cat, dict):
+                continue
+            cleaned = self.clean(cat)
+            if not cleaned:
+                continue
+            try:
+                indices = sorted({int(i) for i in cat.get("indices") or []})
+            except (TypeError, ValueError):
+                continue
+            indices = [i for i in indices if i in valid_indices and i not in seen]
+            if not indices:
+                continue
+            seen.update(indices)
+            categories.append({"name": cleaned["name"], "icon": cleaned["icon"], "indices": indices})
+
+        # Anything the model missed, mis-indexed, or that came back malformed
+        # must still show up somewhere rather than silently vanish.
+        leftover = sorted(valid_indices - seen)
+        if leftover:
+            categories.append({
+                "name": "Uncategorised",
+                "icon": "app-window" if (not self.icons or "app-window" in self.icons) else "",
+                "indices": leftover,
+            })
+
+        return {"categories": categories, "windows": windows}, 0
+
     # --------------------------------------------------------------------- pin
 
     def pin(self, ws_arg, name, icon=None):
@@ -933,6 +1023,13 @@ if __name__ == "__main__":
             payload, code = namer.suggest(sys.argv[i + 1])
         except Exception as e:  # a bug here must still exit clean, never a traceback
             payload, code = {"workspace": sys.argv[i + 1], "error": str(e)[:200]}, 1
+        print(json.dumps(payload, separators=(",", ":")))
+        sys.exit(code)
+    elif "--triage" in sys.argv:
+        try:
+            payload, code = namer.triage()
+        except Exception as e:  # a bug here must still exit clean, never a traceback
+            payload, code = {"error": str(e)[:200]}, 1
         print(json.dumps(payload, separators=(",", ":")))
         sys.exit(code)
     elif "--pin" in sys.argv:

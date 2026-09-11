@@ -68,6 +68,7 @@ rsync -a --delete \
   --exclude tools \
   --exclude Workspaces.qml \
   --exclude Overlay.qml \
+  --exclude Triage.qml \
   --exclude phosphor-codepoints.json \
   --exclude fonts \
   --exclude bin \
