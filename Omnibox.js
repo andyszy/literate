@@ -135,6 +135,23 @@ function urlOrSearch(query, search) {
            label: "Search the web for “" + q + "”" }
 }
 
+// Which profile(s) a history row is known in, as initials of the DISPLAY
+// names ("Andy" + "tradewinds.school" -> "AT"). Initials because the column is
+// eighteen pixels wide, display names because the directory name ("Profile 1")
+// is an internal identifier nobody should have to read. It says where a row
+// has been seen; it does not say where Enter will open it -- that is the key's
+// decision and the footer's job to state.
+function profileMark(row) {
+  var names = (row && Array.isArray(row.profileNames)) ? row.profileNames
+    : (row && row.profileName) ? [row.profileName] : []
+  var out = ""
+  for (var i = 0; i < names.length; i++) {
+    var name = String(names[i] || "").replace(/^[^a-z0-9]+/i, "")
+    if (name) out += name.charAt(0).toUpperCase()
+  }
+  return out
+}
+
 // Mirrors bin/literate-workspace-namer's strip_status_glyphs(): drop leading
 // whitespace and symbol/spinner characters so a live Claude Code window title
 // (which carries a status glyph while the agent is working) compares equal to

@@ -176,16 +176,41 @@ class TestHistoryMerge(ChromeDirTest):
         self.assertEqual(by_url["https://a.example/1"]["profileName"], "Andy")
         self.assertEqual(by_url["https://b.example/1"]["profileName"], "tradewinds.school")
 
-    def test_the_same_url_in_two_profiles_stays_two_rows(self):
+    def test_the_same_url_in_two_profiles_is_one_row(self):
+        # This used to assert the opposite, and was right to: while the
+        # profile came from the ROW, two rows were two different answers. Now
+        # the key decides the profile, so they are one answer drawn twice.
         now = time.time()
         make_history(self.chrome / "Default" / "History",
-                     [("https://mail.google.com/", "Inbox", 400, webkit(now), 0)])
+                     [("https://mail.google.com/", "Inbox", 400, webkit(now), 0, 12)])
         make_history(self.chrome / "Profile 1" / "History",
-                     [("https://mail.google.com/", "Inbox", 3, webkit(now), 0)])
+                     [("https://mail.google.com/", "Inbox", 3, webkit(now), 0, 1)])
         rows = [r for r in namer.build_history() if r["url"] == "https://mail.google.com/"]
-        self.assertEqual(len(rows), 2)
-        # ...and neither one absorbed the other's visit count.
-        self.assertEqual(sorted(r["visits"] for r in rows), [3, 400])
+        self.assertEqual(len(rows), 1)
+        # Signals add up: one person typed it from both accounts.
+        self.assertEqual(rows[0]["visits"], 403)
+        self.assertEqual(rows[0]["typedCount"], 13)
+        # ...and the row still says where it has been seen, so the UI can show
+        # that Shift+Enter is meaningful here.
+        self.assertEqual(sorted(rows[0]["profiles"]), ["Default", "Profile 1"])
+        self.assertEqual(sorted(rows[0]["profileNames"]), ["Andy", "tradewinds.school"])
+
+    def test_a_merged_row_keeps_the_best_ranked_origin_for_its_icon(self):
+        now = time.time()
+        make_history(self.chrome / "Default" / "History",
+                     [("https://mail.google.com/", "Inbox", 2, webkit(now), 0)])
+        make_history(self.chrome / "Profile 1" / "History",
+                     [("https://mail.google.com/", "Work inbox", 900, webkit(now), 0)])
+        row = [r for r in namer.build_history() if r["url"] == "https://mail.google.com/"][0]
+        self.assertEqual(row["profile"], "Profile 1")
+        self.assertEqual(row["title"], "Work inbox")
+
+    def test_a_url_in_one_profile_is_untouched_by_the_merge(self):
+        make_history(self.chrome / "Default" / "History",
+                     [("https://a.example/", "a", 5, webkit(time.time()), 0)])
+        row = namer.build_history()[0]
+        self.assertEqual(row["profiles"], ["Default"])
+        self.assertEqual(row["visits"], 5)
 
     def test_the_floor_keeps_a_small_profile_alive_under_the_cap(self):
         # The shape this whole change exists for: one profile with far more
@@ -310,6 +335,38 @@ class TestTypedHistory(ChromeDirTest):
                      + self.rows(30, visits=4))
         kept = namer.build_history(limit=20, floor=0)
         self.assertNotIn("https://redirect.example/", [r["url"] for r in kept])
+
+
+class TestProfileOrder(ChromeDirTest):
+    """Which profile Enter opens a link in. The UI reads position 0 and never
+    asks a history row, so the order here IS the rule."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_local_state({"Default": {"name": "Andy"},
+                                "Profile 1": {"name": "tradewinds.school"}})
+        make_history(self.chrome / "Default" / "History", [])
+        make_history(self.chrome / "Profile 1" / "History", [])
+
+    def test_chromes_own_default_leads_when_nothing_is_configured(self):
+        self.assertEqual(namer.omnibox_profiles(),
+                         [{"dir": "Default", "name": "Andy", "primary": True},
+                          {"dir": "Profile 1", "name": "tradewinds.school", "primary": False}])
+
+    def test_the_config_key_takes_either_the_directory_or_the_name(self):
+        for key in ("Profile 1", "tradewinds.school", "TRADEWINDS.SCHOOL"):
+            first = namer.omnibox_profiles(primary=key)[0]
+            self.assertEqual((first["dir"], first["primary"]), ("Profile 1", True), key)
+
+    def test_an_unknown_primary_falls_back_rather_than_failing(self):
+        # A config (or a keybind) naming a profile that has since been deleted
+        # must still leave a usable omnibox.
+        self.assertEqual(namer.omnibox_profiles(primary="Profile 9")[0]["dir"], "Default")
+
+    def test_the_index_ships_the_order_and_the_search_engine(self):
+        payload = namer.build_omnibox_index(primary="Profile 1")
+        self.assertEqual([p["dir"] for p in payload["profiles"]], ["Profile 1", "Default"])
+        self.assertIn("{searchTerms}", payload["search"]["template"])
 
 
 class TestFavicons(ChromeDirTest):

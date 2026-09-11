@@ -504,11 +504,30 @@ to be -- holding its own `History` and `Favicons`. Anything that hardcodes
   calls it `tradewinds.school`. It is 14 KB, so reading it per pass is free.
   If it is missing or unparseable, fall back to globbing `*/History` -- the
   directory name then has to stand in for both.
-- Every history row carries `profile` (the directory, the stable key) and
-  `profileName` (what to show someone). **Rows are never merged across
-  profiles**, even for the same URL: summing two accounts' visit counts
-  invents a rank neither earned, and one row can only carry one profile tag,
-  which throws away the one thing the person keeps two profiles to keep apart.
+- Every history row carries `profile`/`profileName` (the best-ranked origin,
+  which is what picks the favicon) and `profiles`/`profileNames` (everywhere
+  the URL is known). **Rows ARE merged across profiles, by URL.** This
+  reverses an earlier decision, and the reason is that the decision it served
+  is gone: while the profile came from the *row*, two rows for one URL were
+  two different answers, and merging them threw away the one thing two
+  profiles exist to keep apart. Now the KEY decides the profile (Enter =
+  primary, Shift+Enter = the next), so two such rows are one answer drawn
+  twice -- same title, same URL, same behaviour on Enter. Signals add up,
+  because one person typed it from both accounts. Five URLs merge on this
+  machine, mail.google.com and gmail.com among them.
+- **Enter/Shift+Enter pick the profile; the row never does.** Gmail, Calendar
+  and Drive accumulate history in both accounts, so a row's origin is an
+  accident of which one opened the page last, and a rule derived from it sends
+  the same keystroke somewhere different on different days -- which is the one
+  thing muscle memory cannot absorb. `omnibox_profiles()` therefore ships an
+  ORDER (primary first, `omnibox_primary_profile` to change it) in the index,
+  the UI binds Enter to position 0 and Shift+Enter to the next, and the footer
+  names both in their **display** names. With three or more profiles Shift's
+  target cycles on CTRL+TAB and is always named in the footer, because a key
+  that silently picks one of three is not a rule either. The summon payload's
+  `"profile"` key (a directory name, validated against the index) arms a
+  different profile for one invocation, which is how a second chord can mean
+  "this time, the other account".
 - The cap is spent floor-first (`OMNIBOX_HISTORY_PROFILE_FLOOR`): each profile
   takes its own best rows up to the floor, then the rest of the budget goes on
   global rank. Without it the old profile (27 MB of History here) sweeps all

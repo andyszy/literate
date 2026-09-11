@@ -102,7 +102,10 @@ Item {
       root.suggestedIcon = ""
       root.suggestedWindows = []
       root.groups = []
-      shelfView.open(payload.query)
+      // "profile" arms which Chrome profile Enter opens links in for this
+      // invocation, so a second chord can mean "this time, the other account"
+      // without changing what Enter means the rest of the time.
+      shelfView.open(payload.query, payload.profile)
       // Same reason as triage: SUPER+SHIFT+<n> is a global Hyprland bind the
       // compositor would consume before a plain Wayland client ever sees it --
       // and so are the user's own Terminal/Browser/agent chords, which the

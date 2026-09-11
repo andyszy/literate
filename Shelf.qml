@@ -102,7 +102,8 @@ Item {
   // ({"mode":"shelf","query":"omarchy"}): summoning straight into an answer is
   // the same view, and it is the only way to exercise the query state without
   // a keyboard.
-  function open(initialQuery) {
+  function open(initialQuery, armedProfile) {
+    root.armProfile(armedProfile)
     root.selectedWorkspace = 0
     root.query = String(initialQuery || "")
     var initial = Omnibox.urlOrSearch(root.query, root.searchEngine)
@@ -493,6 +494,100 @@ Item {
   readonly property var searchEngine: (root.omniboxIndex && root.omniboxIndex.search)
     ? root.omniboxIndex.search : null
 
+  // ------------------------------------------------------- Chrome profiles
+  //
+  // THE KEY DECIDES, NEVER THE ROW. Enter opens a link in the armed profile
+  // and Shift+Enter in the next one, whatever profile the matched history row
+  // happens to have been recorded in. Deriving it from the row was tried and
+  // is wrong: Gmail, Calendar and Drive accumulate history in both accounts,
+  // so the row's origin is an accident of which one opened the page last, and
+  // the same keystroke would go somewhere different on different days. Muscle
+  // memory needs a rule, and "the key I pressed" is the only rule available
+  // that a person can hold.
+  //
+  // The list is enumerated by the daemon from Local State's profile.info_cache
+  // and arrives primary-first in the index. An empty list (no index yet, or
+  // Chrome never run) falls back to the plain browser launcher, which is
+  // exactly the old behaviour.
+  readonly property var chromeProfiles:
+    (root.omniboxIndex && Array.isArray(root.omniboxIndex.profiles))
+      ? root.omniboxIndex.profiles : []
+  // Which profile Enter opens in. Normally the configured primary, i.e. index
+  // 0; a summon payload may arm another one for that invocation
+  // ({"mode":"shelf","profile":"Profile 1"}), which is how a second chord can
+  // mean "this time, the other account" without changing what Enter means the
+  // rest of the time.
+  property int enterAt: 0
+  // How far past it Shift+Enter reaches. Only ever moves with three or more
+  // profiles, where it cycles -- and the footer always names the profile it is
+  // pointing at, because a key that silently picks one of three is not a rule.
+  property int shiftOffset: 1
+
+  function profileAt(i) {
+    var n = root.chromeProfiles.length
+    return n === 0 ? null : root.chromeProfiles[((i % n) + n) % n]
+  }
+
+  readonly property var enterProfile: root.profileAt(root.enterAt)
+  readonly property var shiftProfile: root.chromeProfiles.length > 1
+    ? root.profileAt(root.enterAt + root.shiftOffset) : null
+
+  // The payload names a profile DIRECTORY ("Profile 1"), since that is the
+  // stable key; an unknown one falls back to the primary rather than failing,
+  // because a bind with a stale profile name in it must still open the shelf.
+  function armProfile(directory) {
+    root.shiftOffset = 1
+    root.enterAt = 0
+    var wanted = String(directory || "")
+    if (!wanted) return
+    for (var i = 0; i < root.chromeProfiles.length; i++)
+      if (root.chromeProfiles[i] && root.chromeProfiles[i].dir === wanted) {
+        root.enterAt = i
+        return
+      }
+  }
+
+  // True when Enter would hand a URL to a browser, i.e. when the profile
+  // question even arises. A window or a conversation has nothing to do with
+  // Chrome and must not claim otherwise in the footer.
+  function opensInBrowser() {
+    if (root.activeRegion === "action") return root.queryAction !== null
+    if (root.activeRegion !== "panel") return false
+    var row = root.currentRow()
+    return !!(row && row.kind === "history")
+  }
+
+  // What Enter does right now, in words, for the footer. When it opens a link
+  // it names the ACCOUNT rather than the verb, because with two profiles the
+  // interesting half of "open" is which one -- and it is stated rather than
+  // implied, so Shift+Enter is never a guess.
+  function enterHint() {
+    if (root.activeRegion === "shelf")
+      return "⏎ " + (root.selectedWorkspace > 0
+        ? "go to workspace " + root.selectedWorkspace : "type to search")
+    if (root.opensInBrowser() && root.enterProfile) {
+      var hint = "⏎ " + root.profileName(root.enterProfile)
+      if (root.shiftProfile) hint += " · ⇧⏎ " + root.profileName(root.shiftProfile)
+      if (root.chromeProfiles.length > 2) hint += " (⌃⇥ next)"
+      return hint
+    }
+    if (root.activeRegion === "action")
+      return "⏎ " + (root.queryAction && root.queryAction.kind === "open"
+        ? "open it" : "search the web")
+    return "⏎ focus / resume / open"
+  }
+
+  function cycleShiftProfile() {
+    var n = root.chromeProfiles.length
+    if (n <= 2) return          // with two, "the other one" is not a choice
+    root.shiftOffset = (root.shiftOffset % (n - 1)) + 1
+  }
+
+  function profileName(profile) {
+    // Never the directory: "Profile 1" is an internal identifier.
+    return (profile && profile.name) ? String(profile.name) : ""
+  }
+
   function windowsForTile() {
     var out = []
     for (var i = 0; i < root.wsTiles.length; i++) {
@@ -717,15 +812,23 @@ Item {
     launchProc.running = true
   }
 
-  function openUrl(url) {
+  // `secondary` is the Shift half of the chord, not a property of the row:
+  // the same row opens in either account depending only on which key was
+  // pressed. Chrome's --profile-directory takes the DIRECTORY name, which is
+  // why the index carries both that and the display name.
+  function openUrl(url, secondary) {
     if (!url) return
-    var cmd = "omarchy launch browser " + Util.shellQuote(url)
+    var profile = secondary ? root.shiftProfile : root.enterProfile
+    var cmd = (profile && profile.dir)
+      ? ("setsid uwsm-app -- google-chrome-stable --profile-directory="
+         + Util.shellQuote(profile.dir) + " " + Util.shellQuote(url))
+      : ("omarchy launch browser " + Util.shellQuote(url))
     launchProc.command = ["hyprctl", "dispatch", root.execCmdDispatch(cmd)]
     launchProc.running = true
   }
 
-  function openHistoryEntry(hist) {
-    if (hist && hist.url) root.openUrl(hist.url)
+  function openHistoryEntry(hist, secondary) {
+    if (hist && hist.url) root.openUrl(hist.url, secondary)
   }
 
   // Enter on a board goes to that workspace; Enter on a row acts on the row.
@@ -733,14 +836,14 @@ Item {
   // particular not "does the panel happen to have rows", which is what this
   // used to ask and is why hovering board 3 and pressing Enter landed on
   // workspace 1.
-  function activateCurrent() {
+  function activateCurrent(secondary) {
     if (root.activeRegion === "shelf") {
       if (root.selectedWorkspace > 0) root.gotoWorkspace(root.selectedWorkspace)
       return
     }
     if (root.activeRegion === "action") {
       if (root.queryAction) {
-        root.openUrl(root.queryAction.url)
+        root.openUrl(root.queryAction.url, secondary)
         root.closeRequested()
       }
       return
@@ -749,7 +852,7 @@ Item {
     if (!row) return
     if (row.kind === "conversation") { root.openConversation(row.conversation); return }
     if (row.kind === "history") {
-      root.openHistoryEntry(row.history); root.closeRequested(); return
+      root.openHistoryEntry(row.history, secondary); root.closeRequested(); return
     }
     if (row.kind === "window" && row.window && row.window.address)
       root.focusAddress(row.window.address)   // defers its own close
@@ -781,6 +884,10 @@ Item {
       if (root.query) root.setQuery("")
       else root.closeRequested()
       event.accepted = true
+    } else if (event.key === Qt.Key_Tab && (event.modifiers & Qt.ControlModifier)) {
+      // Only does anything with three or more profiles; see cycleShiftProfile.
+      root.cycleShiftProfile()
+      event.accepted = true
     } else if (event.key === Qt.Key_Backtab
         || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
       root.selectTile(-1)
@@ -801,7 +908,9 @@ Item {
       root.select(1)
       event.accepted = true
     } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-      root.activateCurrent()
+      // Shift is the profile switch and nothing else: same row, same query,
+      // other account.
+      root.activateCurrent((event.modifiers & Qt.ShiftModifier) !== 0)
       event.accepted = true
     } else if (Util.editsFilter(event, root.query)) {
       root.setQuery(Util.editedFilter(event, root.query))
@@ -1953,7 +2062,14 @@ Item {
               width: Style.space(18)
               horizontalAlignment: Text.AlignRight
               textFormat: Text.PlainText
-              text: rowRoot.isWindow ? String(rowRoot.modelData.window.workspace) : "—"
+              // A window says which workspace it is on; a history row says
+              // which account(s) it has been seen in -- initials, because the
+              // column is narrow and the directory name is unspeakable. It is
+              // NOT where Enter will open it: that is the key's decision, and
+              // the footer states it.
+              text: rowRoot.isWindow ? String(rowRoot.modelData.window.workspace)
+                : rowRoot.isHistory ? (Omnibox.profileMark(rowRoot.modelData.history) || "—")
+                : "—"
               color: Util.alpha(rowBody.fg, 0.5)
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -2031,13 +2147,7 @@ Item {
           verticalAlignment: Text.AlignVCenter
           textFormat: Text.PlainText
           text: {
-            var hint = "⇥ workspace    ↑↓ item    ⏎ " + (root.activeRegion === "shelf"
-              ? (root.selectedWorkspace > 0 ? "go to workspace " + root.selectedWorkspace
-                                            : "type to search")
-              : root.activeRegion === "action"
-              ? (root.queryAction && root.queryAction.kind === "open" ? "open it"
-                                                                      : "search the web")
-              : "focus / resume / open")
+            var hint = "⇥ workspace    ↑↓ item    " + root.enterHint()
             if (root.query.length > 0) {
               // Only meaningful with something typed, and only for the chords
               // actually discovered on this machine.

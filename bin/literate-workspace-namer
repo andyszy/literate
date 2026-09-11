@@ -177,6 +177,12 @@ DEFAULTS = {
     # browsing history into a personal search box, so this is the narrowing
     # switch for that, one step short of omnibox_index: false.
     "chrome_profiles": [],
+    # Which profile the omnibox treats as PRIMARY -- the one plain Enter opens
+    # a link in, with the others reachable on Shift+Enter. Matched against
+    # either the directory ("Profile 1") or the display name
+    # ("tradewinds.school"). Empty means Chrome's own "Default" directory, or
+    # failing that whichever profile is enumerated first.
+    "omnibox_primary_profile": "",
 }
 
 # Almost every GUI app appends its own name to the title. Left in, the model
@@ -1185,6 +1191,36 @@ def chrome_profile_dirs(selected=None):
     return found
 
 
+def omnibox_profiles(selected=None, primary=None):
+    """[{"dir", "name", "primary"}, ...] with the primary profile first.
+
+    The UI needs an ORDER, not a set: with no address bar left, Enter opens a
+    link in the primary profile and Shift+Enter in the next one, and which is
+    which has to be the same tomorrow as it was today. Deriving it from the
+    matched history row instead was tried and is wrong -- Gmail, Calendar and
+    Drive accumulate history in *both* profiles, so the row's origin is an
+    accident of which account last opened the page, and the same keystroke
+    would land somewhere different on different days. The key decides; the row
+    never does.
+
+    `primary` is the omnibox_primary_profile config key, matched on either the
+    directory or the display name. Without it the primary is Chrome's own
+    "Default" directory, which is the one the browser itself opens with.
+    """
+    found = chrome_profile_dirs(selected)
+    wanted = str(primary or "").strip().lower()
+    def rank(pair):
+        directory, name = pair
+        if wanted and wanted in (directory.lower(), name.lower()):
+            return 0
+        if not wanted and directory == "Default":
+            return 0
+        return 1
+    ordered = sorted(found, key=rank)  # stable: ties keep Chrome's own order
+    return [{"dir": directory, "name": name, "primary": i == 0}
+            for i, (directory, name) in enumerate(ordered)]
+
+
 def sqlite_immutable(path):
     """Open one of Chrome's live sqlite databases read-only.
 
@@ -1300,13 +1336,54 @@ def build_profile_history(directory, profile_name, oversample, floor, now):
             "lastVisit": last,
             # Which account this row came from: the directory is the stable key
             # a config or a UI filter uses, the name is what the person calls
-            # it. Rows are never merged across profiles, so both always name
-            # exactly one account.
+            # it. After merge_duplicate_urls() a row can be known in several,
+            # and `profiles`/`profileNames` carry the full set; these two stay
+            # the best-ranked origin, which is what picks the favicon.
             "profile": directory,
             "profileName": profile_name,
+            "profiles": [directory],
+            "profileNames": [profile_name],
         }))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     return scored
+
+
+def merge_duplicate_urls(scored):
+    """One row per URL, however many profiles have visited it.
+
+    This reverses a deliberate earlier decision, and the reason is that the
+    decision it served is gone. While the profile came from the ROW, two rows
+    for one URL were two different answers -- open it as work, open it as
+    personal -- and merging them would have thrown away the only thing a
+    two-profile user keeps two profiles for. Now the KEY decides the profile
+    and the row does not, so those two rows are one answer rendered twice:
+    identical title, identical URL, and Enter does exactly the same thing on
+    either. A list that offers the same choice twice is just a shorter list.
+
+    Ranking signals add up instead of competing -- a URL typed in both
+    accounts was typed by one person -- and the surviving row keeps the
+    best-ranked origin's title, app and `profile` (so the favicon still comes
+    from the account whose icon the row actually earned) while `profiles` and
+    `profileNames` record everywhere it is known, which is what lets the UI
+    say "this one exists on both sides" instead of silently picking.
+    """
+    merged, order = {}, []
+    for score, entry in scored:
+        url = entry["url"]
+        if url not in merged:
+            merged[url] = [score, dict(entry)]
+            order.append(url)
+            continue
+        best, row = merged[url]
+        row["visits"] = row.get("visits", 0) + entry.get("visits", 0)
+        row["typedCount"] = row.get("typedCount", 0) + entry.get("typedCount", 0)
+        row["lastVisit"] = max(row.get("lastVisit", 0), entry.get("lastVisit", 0))
+        for directory, name in zip(entry.get("profiles", []), entry.get("profileNames", [])):
+            if directory not in row["profiles"]:
+                row["profiles"].append(directory)
+                row["profileNames"].append(name)
+        merged[url][0] = (row["typedCount"], max(best[1], score[1]))
+    return [tuple(merged[url]) for url in order]
 
 
 def build_history(limit=OMNIBOX_HISTORY_LIMIT, profiles=None,
@@ -1315,12 +1392,9 @@ def build_history(limit=OMNIBOX_HISTORY_LIMIT, profiles=None,
     typed-destinations-first (see _typed_rows) with the recency/visits blend
     ordering everything below them, capped at `limit`.
 
-    A URL visited from two profiles stays **two rows**. Summing their visit
-    counts would invent a rank neither account earned, and one row can only
-    carry one profile tag, so the UI could no longer say which account a hit
-    belongs to -- which is the whole reason someone runs two profiles. A work
-    Gmail thread and a personal one are different pages that merely share a
-    URL shape.
+    A URL visited from two profiles is ONE row: since the key and not the row
+    decides which profile a link opens in, two identical rows are one answer
+    printed twice. See merge_duplicate_urls().
 
     The cap is spent floor-first: every profile takes its own best rows up to
     `floor`, then what is left of the budget goes to the highest-scoring rows
@@ -1349,6 +1423,13 @@ def build_history(limit=OMNIBOX_HISTORY_LIMIT, profiles=None,
         pool.extend(rows[share:])
     pool.sort(key=lambda pair: pair[0], reverse=True)
     kept.extend(pool[:max(0, limit - len(kept))])
+    kept.sort(key=lambda pair: pair[0], reverse=True)
+    # Last, so the floor still guarantees each profile its own share of the
+    # budget: a merge earlier would let one profile's rows quietly stand in for
+    # another's. Duplicates are rare (zero across the two profiles on this
+    # machine, whose deep-linked URLs never coincide), so this is a correctness
+    # measure rather than a way to reclaim budget.
+    kept = merge_duplicate_urls(kept)
     kept.sort(key=lambda pair: pair[0], reverse=True)
     return [entry for _score, entry in kept[:limit]]
 
@@ -1516,22 +1597,26 @@ def attach_favicons(entries, profiles=None, directory=FAVICON_DIR):
             path.unlink(missing_ok=True)  # no row points at it any more
 
 
-def build_omnibox_index(profiles=None):
+def build_omnibox_index(profiles=None, primary=None):
     history = build_history(profiles=profiles)
     try:
         attach_favicons(history, profiles)
     except Exception as e:  # decoration: never lose an index over an icon
         log("omnibox: favicons failed:", e)
-    known = chrome_profile_dirs(profiles)
+    known = omnibox_profiles(profiles, primary)
     return {
         "updatedAt": int(time.time()),
         "conversations": build_conversations(),
         "history": history,
+        # Primary first. The UI binds Enter to the first and Shift+Enter to the
+        # rest, and shows the display names -- never the directory, which is an
+        # internal identifier and an ugly one ("Profile 1").
+        "profiles": known,
         # The UI's fallback action ("search the web for what you typed") has to
         # go somewhere, and with no Chrome address bar left there is no second
         # place to correct it. So it ships in the index, read from Chrome
         # itself rather than assumed.
-        "search": chrome_search_engine(known[0][0]) if known else dict(GOOGLE_SEARCH),
+        "search": chrome_search_engine(known[0]["dir"]) if known else dict(GOOGLE_SEARCH),
     }
 
 
@@ -2296,7 +2381,8 @@ class Namer:
         try:
             self.omnibox_at = now
             t0 = time.time()
-            payload = build_omnibox_index(self.cfg.get("chrome_profiles"))
+            payload = build_omnibox_index(self.cfg.get("chrome_profiles"),
+                                          self.cfg.get("omnibox_primary_profile"))
             write_atomic(OMNIBOX_INDEX_PATH, payload)
             log(f"omnibox index rebuilt: {len(payload['conversations'])} conversations, "
                 f"{len(payload['history'])} history rows in {time.time() - t0:.2f}s")
@@ -2508,7 +2594,8 @@ if __name__ == "__main__":
         # just from the daemon's own opportunistic refresh.
         t0 = time.time()
         try:
-            payload = build_omnibox_index(namer.cfg.get("chrome_profiles"))
+            payload = build_omnibox_index(namer.cfg.get("chrome_profiles"),
+                                          namer.cfg.get("omnibox_primary_profile"))
             write_atomic(OMNIBOX_INDEX_PATH, payload)
         except Exception as e:  # a bug here must still exit clean, never a traceback
             log("--index-omnibox failed:", e)
