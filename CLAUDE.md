@@ -303,8 +303,11 @@ it must stay in `tools/sync-upstream`'s `--exclude` list.
 - **The answer is precomputed, not computed on the keypress.** The daemon is
   already sitting on the event socket and already knows when the window set
   settled, so `fire()` calls `maybe_precompute_triage()` after each debounced
-  pass and writes the result to `~/.local/state/literate/triage.json`, in the
-  exact shape `--triage` prints plus a `signature`.
+  pass and writes the result to `~/.local/state/literate/triage.json`.
+  `--triage` then returns that file when its `signature` matches the live
+  window set: ~45 ms instead of ~1.4 s, and no model call. The payload is the
+  same shape either way plus `"cached": true|false`, so the UI parses one
+  format. `--triage --no-cache` always asks the model.
 - The precompute deliberately runs **outside `pass_lock`**, after `apply()`
   has returned. Naming is the daemon's job; triage is opportunistic. A failed
   precompute is logged and dropped (the signature is not recorded, so the next
