@@ -109,6 +109,8 @@ Item {
     root.rebuild()
     root.opened = true
     root.windowVisible = true
+    root.priming = true
+    primeTimer.restart()
     collapseAnim.stop()
     expandAnim.restart()
     // Cheap, and it means rebinding Terminal takes effect on the next summon
@@ -195,16 +197,15 @@ Item {
 
   function lerp(a, b, p) { return a + (b - a) * p }
 
-  // Bumped to ask every board for one fresh frame. See the ScreencopyView
-  // below for why the captures are not live.
-  property int captureTick: 0
+  // Capture streams only for the moment it takes to fill the boards, then
+  // stops. See the ScreencopyView below.
+  property bool priming: false
 
   Timer {
-    running: root.windowVisible
-    interval: 1500
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.captureTick += 1
+    id: primeTimer
+    interval: 600
+    repeat: false
+    onTriggered: root.priming = false
   }
 
   function setQuery(text) {
@@ -1536,17 +1537,17 @@ Item {
                 ScreencopyView {
                   id: shot
                   captureSource: root.windowVisible ? cell.modelData.toplevel.wayland : null
-                  // NOT live. Nine continuously-streaming ScreencopyViews cost
-                  // the shell ~16% of a core for as long as the shelf is up
-                  // (measured); one frame each on a slow tick costs ~1%, and a
-                  // thumbnail that is a second and a half stale is not a
-                  // thumbnail anyone can tell apart from a live one. The tick
-                  // only runs while the surface is visible.
-                  live: false
+                  // Live only for the moment it takes to fill in, then frozen.
+                  // Nine continuously-streaming views cost the shell ~16% of a
+                  // core for as long as the shelf is up (measured); a shelf is
+                  // a glance, and a picture that stops moving after the first
+                  // frame is not one anybody can pick out. captureFrame() on
+                  // its own is not an alternative -- called before the capture
+                  // session exists it just warns "no recording context is
+                  // ready" and returns nothing, and there is no signal for
+                  // when that becomes true.
+                  live: root.windowVisible && root.priming
                   paintCursor: false
-                  readonly property int tick: root.captureTick
-                  onTickChanged: if (shot.captureSource) shot.captureFrame()
-                  onCaptureSourceChanged: if (shot.captureSource) shot.captureFrame()
                   // Cover, anchored top-left. ScreencopyView preserves the
                   // source aspect inside its own bounds, so handing it the
                   // source's aspect ratio and clipping is what produces a
