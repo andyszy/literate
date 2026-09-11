@@ -293,13 +293,33 @@ it must stay in `tools/sync-upstream`'s `--exclude` list.
   is never injected into by the host, since it isn't an entry point — only
   `Overlay.qml` receives `omarchyPath`/`shell`/`manifest`/`pluginRegistry`,
   and hands `Triage.qml` only what it needs (`binPath`) as a plain property.
-- `literate-workspace-namer --triage` makes one model call over every
-  filtered window on every real workspace (reusing `_filtered_clients()`),
-  asking the model to group by what the user is *doing*, not by which app is
-  open. Every category name/icon goes through `self.clean()` like a
-  workspace name does. Indices the model invents or reuses across categories
-  are dropped/deduped; anything left uncategorised lands in a final
-  "Uncategorised" group rather than being lost.
+- `literate-workspace-namer --triage` groups every filtered window on every
+  real workspace (reusing `_filtered_clients()`) by what the user is *doing*,
+  not by which app is open. The model call and all of its validation live in
+  `compute_triage()`: every category name/icon goes through `self.clean()`
+  like a workspace name does, indices the model invents or reuses across
+  categories are dropped/deduped, and anything left uncategorised lands in a
+  final "Uncategorised" group rather than being lost.
+- **The answer is precomputed, not computed on the keypress.** The daemon is
+  already sitting on the event socket and already knows when the window set
+  settled, so `fire()` calls `maybe_precompute_triage()` after each debounced
+  pass and writes the result to `~/.local/state/literate/triage.json`, in the
+  exact shape `--triage` prints plus a `signature`.
+- The precompute deliberately runs **outside `pass_lock`**, after `apply()`
+  has returned. Naming is the daemon's job; triage is opportunistic. A failed
+  precompute is logged and dropped (the signature is not recorded, so the next
+  settled pass retries) and `--triage` just asks live in the meantime.
+- `triage_signature()` is a hash of every window's address+class+title+
+  workspace, **sorted** — hyprctl reorders its reply on focus changes and that
+  is not a change. It is global, unlike the per-workspace naming cache, so one
+  chatty title would otherwise re-ask about the whole desktop every debounce
+  window. `triage_min_interval` (30 s) is the floor that stops that; when it
+  bites, the cache goes stale and `--triage` falls back to a live call, which
+  is only ever as slow as the old behaviour. Set `triage_precompute: false` to
+  get exactly the old behaviour back.
+- `run_pass()` gathers `_filtered_clients()` once and derives both the naming
+  snapshot (`group_by_workspace()`) and the triage window list
+  (`triage_windows()`) from it — the precompute costs no extra `hyprctl`.
 
 ## Privacy
 
