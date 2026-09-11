@@ -56,9 +56,14 @@ Item {
   // computeRows() below for how a query reshapes the grouped list.
   property string query: ""
 
+  // False while the keyboard is driving. Set true again by real pointer motion,
+  // so a stationary mouse cannot hijack the cursor as rows reflow underneath it.
+  property bool pointerLive: false
+
   function setQuery(text) {
     if (root.query === text) return
     root.query = text
+    root.pointerLive = false
     root.cursor = 0 // first visible row, every time the query changes
   }
 
@@ -401,6 +406,9 @@ Item {
   function select(delta) {
     var n = root.selectableRows.length
     if (n === 0) return
+    // Arrowing scrolls the list, which slides rows under a stationary pointer;
+    // park the mouse again so its hover cannot fight the keyboard.
+    root.pointerLive = false
     root.cursor = (root.cursor + delta + n) % n
     listView.positionViewAtIndex(root.selectableRows[root.cursor], ListView.Contain)
   }
@@ -948,8 +956,19 @@ Item {
         enabled: !rowRoot.isTier
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
-        onEntered: root.selectRow(rowRoot.index)
+        // onEntered fires when the pointer moves onto a row -- and also when a
+        // row slides under a pointer that never moved, which is what happens on
+        // every keystroke as the results refilter. Honouring that made the
+        // selection appear to jump around at random while typing. Only let the
+        // mouse take the selection once it has actually moved since the last key.
+        onEntered: if (root.pointerLive) root.selectRow(rowRoot.index)
+        onPositionChanged: {
+          if (root.pointerLive) return
+          root.pointerLive = true
+          root.selectRow(rowRoot.index)
+        }
         onClicked: {
+          root.pointerLive = true
           root.selectRow(rowRoot.index)
           root.focusCurrent()
         }
