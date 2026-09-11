@@ -268,6 +268,39 @@ the next re-vendor deletes it silently.
   (not a "Thinking…" row) with the suggested name once the call lands or
   fails or hits its ~10s timeout.
 
+## The triage view
+
+`Triage.qml` is the SUPER+0 full-desktop overview: every window on every
+real workspace, grouped by activity via `literate-workspace-namer --triage`.
+It is a fork-owned file exactly like `Workspaces.qml` and `Overlay.qml` —
+it must stay in `tools/sync-upstream`'s `--exclude` list.
+
+- It is **not** a manifest entry point. The obvious design — a new `"panel"`
+  kind with `entryPoints.panel: "Triage.qml"` — doesn't work: shell.qml's
+  `computePanelEntries()` builds exactly one panel/overlay/menu Loader **per
+  plugin id**, picking a single entry point by kind priority
+  `panel > overlay > menu`. Adding `"panel"` alongside this plugin's existing
+  `"overlay"` kind would make the host pick `"panel"` and never resolve
+  `entryPoints.overlay` again — `Overlay.qml`, and the whole per-workspace
+  hold-menu, would silently stop being summonable. So `Triage.qml` is a plain
+  QML component that `Overlay.qml` instantiates directly (implicit
+  same-directory import), mounted inside `Overlay.qml`'s existing
+  `PanelWindow`. Summon it with
+  `omarchy-shell shell summon literate '{"mode":"triage"}'`; `Overlay.qml`'s
+  `open()` reads the payload's `"mode"` field to pick which of the two
+  lifecycles to run.
+- Same host-injection trap as `Overlay.qml` (see above): `Triage.qml` itself
+  is never injected into by the host, since it isn't an entry point — only
+  `Overlay.qml` receives `omarchyPath`/`shell`/`manifest`/`pluginRegistry`,
+  and hands `Triage.qml` only what it needs (`binPath`) as a plain property.
+- `literate-workspace-namer --triage` makes one model call over every
+  filtered window on every real workspace (reusing `_filtered_clients()`),
+  asking the model to group by what the user is *doing*, not by which app is
+  open. Every category name/icon goes through `self.clean()` like a
+  workspace name does. Indices the model invents or reuses across categories
+  are dropped/deduped; anything left uncategorised lands in a final
+  "Uncategorised" group rather than being lost.
+
 ## Privacy
 
 Window titles for every workspace go to the model. Keep `ignore_classes` and

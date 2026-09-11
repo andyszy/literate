@@ -11,6 +11,13 @@ import qs.Ui
 // '{"workspace":"3"}'` -- see bin/literate-workspace-namer --suggest for the
 // payload this reads.
 //
+// Also hosts the full-desktop triage view (Triage.qml), summoned with
+// `omarchy-shell shell summon literate '{"mode":"triage"}'`: every window on
+// every workspace, grouped by activity via `literate-workspace-namer
+// --triage`. It lives here rather than as its own manifest entry point --
+// see Triage.qml's header comment for why -- selected by root.triageMode,
+// which open() sets from the payload's "mode" field.
+//
 // Lifecycle contract mirrors /usr/share/omarchy/shell/plugins/menu/Menu.qml
 // and plugins/clipboard/Clipboard.qml: open(payloadJson)/close()/ping(), and
 // every host-injected property below is PLAIN with a default, never
@@ -30,6 +37,12 @@ Item {
   // ---------------------------------------------------------------- state
 
   property bool opened: false
+  // Selects which of the two lifecycle contracts below open()/close() run:
+  // the per-workspace action menu (default), or the full-desktop triage
+  // view in Triage.qml, driven by the summon payload's "mode" field. See
+  // Triage.qml's header comment for why this lives here rather than as its
+  // own manifest entry point.
+  property bool triageMode: false
   property string workspaceId: ""
   property int windowCount: -1
   // Fallback close-all target list, filled from `hyprctl -j clients` so the
@@ -63,17 +76,7 @@ Item {
     var payload = ({})
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = ({}) }
 
-    root.workspaceId = String(payload.workspace || "")
     root.opened = true
-    root.windowCount = -1
-    root.fallbackAddresses = []
-    root.suggestLoading = true
-    root.suggestFailed = false
-    root.suggestErrorText = ""
-    root.suggestedName = ""
-    root.suggestedIcon = ""
-    root.suggestedWindows = []
-    root.groups = []
     root.manualRenameActive = false
     root.manualRenameText = ""
     root.spinOutMode = false
@@ -81,14 +84,40 @@ Item {
     root.cursorActive = false
     root.selectedIndex = 0
 
-    // Window count so the header can read "Workspace N · M windows" the
-    // instant the panel appears, without waiting on the model call.
-    clientsProc.command = ["hyprctl", "-j", "clients"]
-    clientsProc.running = true
+    root.triageMode = payload.mode === "triage"
+    if (root.triageMode) {
+      root.workspaceId = ""
+      root.windowCount = -1
+      root.fallbackAddresses = []
+      root.suggestLoading = false
+      root.suggestFailed = false
+      root.suggestErrorText = ""
+      root.suggestedName = ""
+      root.suggestedIcon = ""
+      root.suggestedWindows = []
+      root.groups = []
+      triageView.open()
+    } else {
+      root.workspaceId = String(payload.workspace || "")
+      root.windowCount = -1
+      root.fallbackAddresses = []
+      root.suggestLoading = true
+      root.suggestFailed = false
+      root.suggestErrorText = ""
+      root.suggestedName = ""
+      root.suggestedIcon = ""
+      root.suggestedWindows = []
+      root.groups = []
 
-    suggestProc.command = [root.binPath, "--suggest", root.workspaceId]
-    suggestProc.running = true
-    suggestTimeoutTimer.restart()
+      // Window count so the header can read "Workspace N · M windows" the
+      // instant the panel appears, without waiting on the model call.
+      clientsProc.command = ["hyprctl", "-j", "clients"]
+      clientsProc.running = true
+
+      suggestProc.command = [root.binPath, "--suggest", root.workspaceId]
+      suggestProc.running = true
+      suggestTimeoutTimer.restart()
+    }
 
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -99,6 +128,7 @@ Item {
     root.spinOutMode = false
     suggestTimeoutTimer.stop()
     if (suggestProc.running) suggestProc.running = false
+    if (root.triageMode) triageView.close()
   }
 
   function ping() { return "ok" }
@@ -351,10 +381,17 @@ Item {
   property int rowsHeight: root.visibleRows.length > 0
     ? (root.visibleRows.length * root.rowHeight + (root.visibleRows.length - 1) * root.rowSpacing)
     : root.rowHeight
-  property int cardWidth: Math.min(Style.space(360), panel.width - Style.gapsOut * 2)
-  property int cardHeight: Math.min(
+  property int workspaceCardWidth: Math.min(Style.space(360), panel.width - Style.gapsOut * 2)
+  property int workspaceCardHeight: Math.min(
     contentMargin * 2 + headerHeight + (statusHeight > 0 ? contentSpacing + statusHeight : 0) + contentSpacing + rowsHeight,
     panel.height - Style.gapsOut * 2)
+  // Triage surveys every window on every workspace, not one workspace's --
+  // it earns most of the screen, capped so it doesn't look absurd on an
+  // ultrawide monitor.
+  property int triageCardWidth: Math.min(panel.width - Style.gapsOut * 4, Style.space(1200))
+  property int triageCardHeight: panel.height - Style.gapsOut * 4
+  property int cardWidth: root.triageMode ? root.triageCardWidth : root.workspaceCardWidth
+  property int cardHeight: root.triageMode ? root.triageCardHeight : root.workspaceCardHeight
 
   Process {
     id: clientsProc
@@ -454,6 +491,11 @@ Item {
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
+          if (root.triageMode) {
+            triageView.handleKey(event)
+            return
+          }
+
           if (root.manualRenameActive) return // the text field owns keys
 
           if (root.spinOutMode) {
@@ -507,6 +549,7 @@ Item {
         anchors.bottomMargin: card.contentBottomInset
         anchors.leftMargin: card.contentLeftInset
         spacing: root.contentSpacing
+        visible: !root.triageMode
 
         // ------------------------------------------------------- header
 
@@ -676,6 +719,23 @@ Item {
             }
           }
         }
+      }
+
+      // Full-desktop triage view -- see Triage.qml's header comment for why
+      // it lives here instead of as its own manifest entry point. Declared
+      // after the swallow-click MouseArea above (and after the workspace
+      // Column) so its own row MouseAreas sit on top for hit-testing, same
+      // as that Column's row delegates already rely on.
+      Triage {
+        id: triageView
+        anchors.fill: parent
+        anchors.topMargin: card.contentTopInset
+        anchors.rightMargin: card.contentRightInset
+        anchors.bottomMargin: card.contentBottomInset
+        anchors.leftMargin: card.contentLeftInset
+        visible: root.triageMode
+        binPath: root.binPath
+        onCloseRequested: root.close()
       }
     }
   }
