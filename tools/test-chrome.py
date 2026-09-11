@@ -443,6 +443,62 @@ class TestFavicons(ChromeDirTest):
         self.assertNotIn("favicon", rows[0])
 
 
+class TestWindowProfile(ChromeDirTest):
+    """Which Chrome profile a WINDOW belongs to -- the question nothing
+    outside Chrome could answer, since every profile shares one browser
+    process and one window class."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_local_state({
+            "Default": {"name": "Andy", "user_name": "andyszy@gmail.com",
+                        "profile_color_seed": -3413569},
+            "Profile 1": {"name": "tradewinds.school", "user_name": "andy@tradewinds.school",
+                          "profile_color_seed": -336013},
+        })
+        make_history(self.chrome / "Default" / "History", [])
+        make_history(self.chrome / "Profile 1" / "History", [])
+        self.meta = namer.chrome_profile_meta()
+
+    def test_chip_colours_are_derived_from_chromes_own_seed(self):
+        # The same values the window title bars use, so a thumbnail and its
+        # window read as the same account.
+        self.assertEqual(namer.profile_chip_colors(-3413569)[0], "#EAF5E6")
+        self.assertEqual(namer.profile_chip_colors(-336013)[0], "#FBF6DF")
+        # Text is the same hue, dark and nearly neutral -- legible on the chip
+        # rather than a saturated ink.
+        self.assertEqual(namer.profile_chip_colors(-3413569)[1], "#353F31")
+        self.assertIsNone(namer.profile_chip_colors(None))
+
+    def test_a_site_app_window_carries_its_profile_in_the_class(self):
+        # Free and exact, with no extension involved at all -- and every
+        # window here is becoming an app-mode window.
+        got = namer.window_profile("chrome-gmail.com__-Profile_1", None, self.meta)
+        self.assertEqual(got["profile"], "Profile 1")
+        self.assertEqual(got["profileName"], "tradewinds.school")
+        self.assertEqual(got["profileColor"], "#FBF6DF")
+
+    def test_a_tabbed_window_is_attributed_by_the_reported_email(self):
+        got = namer.window_profile("google-chrome", {"email": "ANDYSZY@gmail.com"}, self.meta)
+        self.assertEqual((got["profile"], got["profileName"]), ("Default", "Andy"))
+
+    def test_an_unattributable_window_gets_nothing(self):
+        # A wrong work/personal marker is worse than no marker, so every
+        # unknown case has to come back empty rather than fall back to a
+        # default profile.
+        self.assertEqual(namer.window_profile("google-chrome", None, self.meta), {})
+        self.assertEqual(namer.window_profile("google-chrome", {"email": ""}, self.meta), {})
+        self.assertEqual(namer.window_profile("org.omarchy.claude", None, self.meta), {})
+        self.assertEqual(
+            namer.window_profile("chrome-gmail.com__-Profile_9", None, self.meta), {})
+
+    def test_a_profile_with_no_colour_seed_still_names_itself(self):
+        self.write_local_state({"Default": {"name": "Andy"}})
+        meta = namer.chrome_profile_meta()
+        got = namer.window_profile("chrome-mail.google.com__-Default", None, meta)
+        self.assertEqual(got, {"profile": "Default", "profileName": "Andy"})
+
+
 class TestTabFileMerge(unittest.TestCase):
     """load_chrome_tabs() merges one file per extension instance."""
 

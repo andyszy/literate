@@ -583,6 +583,21 @@ to be -- holding its own `History` and `Favicons`. Anything that hardcodes
   all of them. It is the answer to "don't put my work history in my personal
   search box", one step short of `omnibox_index: false`.
 
+**A window's profile is a separate question from a history row's**, and a
+harder one: every profile shares one browser process and hands every window
+the same Hyprland class, so nothing outside Chrome can attribute a window on
+its own. `window_profile()` answers it from two sources and nothing else --
+the profile directory Chrome puts at the end of a *site-app* class
+(`chrome-gmail.com__-Profile_1`), which is free, exact and needs no
+extension; and failing that the signed-in email the literate-tabs extension
+(1.2+) reports, matched against info_cache's `user_name`. Everything else
+gets **nothing**: a window with no attribution is drawn unmarked, because a
+wrong work/personal marker is worse than none. `profile_chip_colors()` turns
+Chrome's `profile_color_seed` into the Tailwind "-100" pair the window title
+bars use (lightness 0.93 at 85% saturation; text the same hue at 0.22/25%),
+so the shelf's thumbnail name chip carries the account's own colour and no
+second badge is needed.
+
 Favicons follow the same rule. `~/.config/google-chrome/<profile>/Favicons`
 joins `icon_mapping` (page URL -> icon) to `favicon_bitmaps` (the PNG), read
 with the same `immutable=1` open, and a row takes **its own profile's icon
