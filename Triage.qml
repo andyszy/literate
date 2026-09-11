@@ -102,10 +102,11 @@ Item {
 
   // ------------------------------------------------------------------- rows
   //
-  // Flattened list of header rows (one per category) and window rows, in
-  // category order. Keyboard/click selection can land on either kind --
-  // computeSelectableRows() is the map from "row you can land on" back to
-  // its position in `rows` (currently every row, see its own comment).
+  // Flattened list of rows: open-window headers/windows, plus, once there is
+  // a query, a "tier" label row and up to root.tierLimit conversation/
+  // history rows per non-empty source tier. Keyboard/click selection can
+  // land on any kind except "tier" -- computeSelectableRows() is the map
+  // from "row you can land on" back to its position in `rows`.
 
   readonly property var rows: root.computeRows()
 
@@ -116,7 +117,13 @@ Item {
   // with an empty body. That drop applies whether or not there is a query --
   // a header for a category with zero visible windows is never emitted, so
   // it can never be landed on (see computeSelectableRows()).
-  function computeRows() {
+  //
+  // With a query, two more tiers follow the open-window one: CONVERSATIONS
+  // and HISTORY, sourced from the omnibox index (see the FileView below).
+  // Both are capped (root.tierLimit) so open windows never get pushed off
+  // screen by a big index; a "tier" row is a plain label, never selectable
+  // (see computeSelectableRows()) -- only real result rows land the cursor.
+  function computeOpenRows() {
     var out = []
     var hasQuery = root.query.length > 0
     for (var c = 0; c < root.categories.length; c++) {
@@ -143,6 +150,193 @@ Item {
     return out
   }
 
+  readonly property int tierLimit: 5
+
+  function computeRows() {
+    var openRows = root.computeOpenRows()
+    if (root.query.length === 0) return openRows // exactly today's triage
+
+    var convMatches = root.matchConversations(root.query)
+    var histMatches = root.matchHistory(root.query)
+    var out = []
+
+    // Only bother labelling the OPEN tier when there is something else on
+    // screen to distinguish it from -- with no conversation/history matches
+    // this degrades to exactly the pre-omnibox search view.
+    if (openRows.length > 0 && (convMatches.length > 0 || histMatches.length > 0))
+      out.push({ kind: "tier", categoryIndex: -1, label: "OPEN" })
+    out = out.concat(openRows)
+
+    if (convMatches.length > 0) {
+      var convShown = convMatches.slice(0, root.tierLimit)
+      out.push({ kind: "tier", categoryIndex: -1, label: "CONVERSATIONS",
+                 shown: convShown.length, total: convMatches.length })
+      for (var i = 0; i < convShown.length; i++)
+        out.push({ kind: "conversation", categoryIndex: -1, conversation: convShown[i] })
+    }
+
+    if (histMatches.length > 0) {
+      var histShown = histMatches.slice(0, root.tierLimit)
+      out.push({ kind: "tier", categoryIndex: -1, label: "HISTORY",
+                 shown: histShown.length, total: histMatches.length })
+      for (var h = 0; h < histShown.length; h++)
+        out.push({ kind: "history", categoryIndex: -1, history: histShown[h] })
+    }
+
+    return out
+  }
+
+  // ------------------------------------------------------------- omnibox
+  //
+  // Rank helper shared by both index tiers: 0 = query starts the text, 1 =
+  // query starts a word inside it, 2 = anywhere else, -1 = no match at all.
+  // Deliberately simple -- plain substring at heart, no fuzzy subsequence
+  // scoring -- so ordering stays predictable.
+  function textRank(text, query) {
+    var t = String(text || "").toLowerCase()
+    var q = query
+    if (!q) return -1
+    var idx = t.indexOf(q)
+    if (idx < 0) return -1
+    if (idx === 0) return 0
+    return /[^a-z0-9]/i.test(t.charAt(idx - 1)) ? 1 : 2
+  }
+
+  function matchConversations(query) {
+    var q = String(query || "").toLowerCase()
+    var convs = (root.omniboxIndex && Array.isArray(root.omniboxIndex.conversations))
+      ? root.omniboxIndex.conversations : []
+    var matched = []
+    for (var i = 0; i < convs.length; i++) {
+      var conv = convs[i]
+      if (!conv) continue
+      var rank = root.textRank(conv.title, q)
+      if (rank < 0) continue
+      matched.push({ item: conv, rank: rank })
+    }
+    matched.sort(function(a, b) {
+      if (a.rank !== b.rank) return a.rank - b.rank
+      return (Number(b.item.mtime) || 0) - (Number(a.item.mtime) || 0)
+    })
+    return matched.map(function(m) { return m.item })
+  }
+
+  function matchHistory(query) {
+    var q = String(query || "").toLowerCase()
+    var hist = (root.omniboxIndex && Array.isArray(root.omniboxIndex.history))
+      ? root.omniboxIndex.history : []
+    var matched = []
+    for (var i = 0; i < hist.length; i++) {
+      var h = hist[i]
+      if (!h) continue
+      var titleRank = root.textRank(h.title, q)
+      var domainRank = root.textRank(h.domain, q)
+      var rank = -1
+      if (titleRank >= 0 && domainRank >= 0) rank = Math.min(titleRank, domainRank)
+      else if (titleRank >= 0) rank = titleRank
+      else if (domainRank >= 0) rank = domainRank
+      if (rank < 0) continue
+      matched.push({ item: h, rank: rank })
+    }
+    matched.sort(function(a, b) {
+      if (a.rank !== b.rank) return a.rank - b.rank
+      var byVisit = (Number(b.item.lastVisit) || 0) - (Number(a.item.lastVisit) || 0)
+      if (byVisit !== 0) return byVisit
+      return (Number(b.item.visits) || 0) - (Number(a.item.visits) || 0)
+    })
+    return matched.map(function(m) { return m.item })
+  }
+
+  // Mirrors bin/literate-workspace-namer's strip_status_glyphs(): drop
+  // leading whitespace and symbol/spinner characters so a live Claude Code
+  // window title (which carries a status glyph while the agent is working)
+  // compares equal to the index's already-clean ai-title. Re-implemented
+  // here rather than imported (bin/ is owned by another agent right now) as
+  // explicit code-point ranges for the Unicode symbol blocks CLI spinners
+  // draw from (arrows/math/misc-technical/geometric-shapes/dingbats/
+  // braille/misc-symbols, plus emoji), rather than the daemon's
+  // unicodedata-category test, since this QML engine's regex support for
+  // \p{..} Unicode property escapes is not something to depend on. This
+  // never touches real letters (Latin, CJK, ...), only the code-point
+  // ranges the spinner glyphs themselves live in.
+  function isStatusGlyphCodePoint(cp) {
+    return (cp >= 0x2190 && cp <= 0x2BFF) || (cp >= 0xFE00 && cp <= 0xFE0F)
+      || (cp >= 0x1F300 && cp <= 0x1FAFF)
+  }
+
+  function stripStatusGlyphs(title) {
+    var s = String(title || "")
+    var i = 0
+    while (i < s.length) {
+      var cp = s.codePointAt(i)
+      if (cp === 0x20 || cp === 0x09) { i += 1; continue }
+      if (root.isStatusGlyphCodePoint(cp)) { i += (cp > 0xFFFF ? 2 : 1); continue }
+      break
+    }
+    return s.slice(i)
+  }
+
+  // Claude Code sets an org.omarchy.claude terminal's window title to the
+  // conversation's ai-title, so a live window whose (glyph-stripped) title
+  // matches the index entry IS that conversation, already open -- jump to
+  // it instead of spawning a duplicate `claude --resume`. Searches
+  // root.windows (the full filtered window inventory triage already has),
+  // not just what the current query happens to show.
+  function findOpenClaudeWindow(title) {
+    var target = String(title || "")
+    if (!target) return null
+    for (var i = 0; i < root.windows.length; i++) {
+      var w = root.windows[i]
+      if (!w || !w.class) continue
+      if (String(w.class).toLowerCase() !== "org.omarchy.claude") continue
+      if (root.stripStatusGlyphs(w.title) === target) return w
+    }
+    return null
+  }
+
+  // Shell-command + Lua-string escaping for hl.dsp.exec_cmd(), which itself
+  // runs the string through a shell (see CLAUDE.md/bindings.lua precedent:
+  // "wpctl set-volume ... @DEFAULT_AUDIO_SINK@" and similar need one).
+  // Util.shellQuote single-quotes for that shell layer; escaping backslash
+  // then double-quote afterwards is what then makes the whole thing safe as
+  // one Lua-string argument to hyprctl dispatch (order matters: escaping
+  // backslash first means the backslashes shellQuote may have just inserted
+  // get escaped too, instead of being re-escaped a second time).
+  function execCmdDispatch(shellCommand) {
+    var lua = shellCommand.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")
+    return 'hl.dsp.exec_cmd("' + lua + '")'
+  }
+
+  function launchClaudeResume(sessionId, project) {
+    var cmd = "setsid uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.claude --dir="
+      + Util.shellQuote(project) + " -e claude --resume " + Util.shellQuote(sessionId)
+    launchProc.command = ["hyprctl", "dispatch", root.execCmdDispatch(cmd)]
+    launchProc.running = true
+  }
+
+  function openUrlInBrowser(url) {
+    var cmd = "omarchy launch browser " + Util.shellQuote(url)
+    launchProc.command = ["hyprctl", "dispatch", root.execCmdDispatch(cmd)]
+    launchProc.running = true
+  }
+
+  function openConversation(conv) {
+    if (!conv) return
+    var existing = root.findOpenClaudeWindow(conv.title)
+    if (existing && existing.address) {
+      focusProc.command = ["hyprctl", "dispatch",
+        'hl.dsp.focus({ window = "address:' + existing.address + '" })']
+      focusProc.running = true
+      return
+    }
+    root.launchClaudeResume(conv.id, conv.project)
+  }
+
+  function openHistoryEntry(hist) {
+    if (!hist || !hist.url) return
+    root.openUrlInBrowser(hist.url)
+  }
+
   readonly property int visibleWindowCount: {
     var n = 0
     for (var i = 0; i < root.rows.length; i++) if (root.rows[i].kind === "window") n++
@@ -154,17 +348,18 @@ Item {
     return n
   }
 
-  // Every row lands on something selectable now -- a header is a stop in its
-  // own right (arrow nav walks header -> its windows -> next header -> ...),
-  // and computeRows() already drops any header left with zero visible rows.
-  // So this is the identity map over `rows`; kept as its own function/array
+  // Every row lands on something selectable, except "tier" labels -- a
+  // header is a stop in its own right (arrow nav walks header -> its
+  // windows -> next header -> ...), and computeRows() already drops any
+  // header left with zero visible rows. Kept as its own function/array
   // (rather than indexing `rows` directly) so currentRow()/select()/
   // selectRow() below don't change shape.
   readonly property var selectableRows: root.computeSelectableRows()
 
   function computeSelectableRows() {
     var out = []
-    for (var i = 0; i < root.rows.length; i++) out.push(i)
+    for (var i = 0; i < root.rows.length; i++)
+      if (root.rows[i].kind !== "tier") out.push(i)
     return out
   }
 
@@ -185,13 +380,22 @@ Item {
 
   // What SUPER+SHIFT+<digit> and Enter will do to the current selection --
   // shown in the header so the scope of a header-level move is legible
-  // before it happens, not after.
+  // before it happens, not after. Moving a workspace is meaningless for a
+  // conversation or history row -- those get an Enter-only hint, so
+  // SUPER+SHIFT+<n> reads as (and is, see moveCurrent()) a no-op rather
+  // than something surprising.
   readonly property string scopeHint: {
     var row = root.currentRow()
     if (!row) return ""
     if (row.kind === "header")
       return "⇧⌘1-9 move all " + row.count + (row.count === 1 ? " window" : " windows")
-    return "⇧⌘1-9 move this window"
+    if (row.kind === "window")
+      return "⇧⌘1-9 move this window"
+    if (row.kind === "conversation")
+      return "⏎ resume conversation"
+    if (row.kind === "history")
+      return "⏎ open in browser"
+    return ""
   }
 
   function select(delta) {
@@ -217,6 +421,18 @@ Item {
   function focusCurrent() {
     var row = root.currentRow()
     if (!row) return
+
+    if (row.kind === "conversation") {
+      root.openConversation(row.conversation)
+      root.closeRequested()
+      return
+    }
+    if (row.kind === "history") {
+      root.openHistoryEntry(row.history)
+      root.closeRequested()
+      return
+    }
+
     var win = row.window
     if (row.kind === "header") {
       var flat = root.selectableRows[root.cursor]
@@ -245,6 +461,9 @@ Item {
   function moveCurrent(target) {
     var row = root.currentRow()
     if (!row) return
+    // Only open windows/categories have a workspace to move to -- a
+    // conversation or history row does nothing here (see scopeHint above).
+    if (row.kind !== "header" && row.kind !== "window") return
     var addrs = []
     if (row.kind === "header") {
       var cat = root.categories[row.categoryIndex]
@@ -404,9 +623,48 @@ Item {
     onLoadFailed: root.cache = null
   }
 
+  // --------------------------------------------------------- omnibox index
+  //
+  // Written by bin/literate-workspace-namer's Claude-conversation/Chrome-
+  // history indexer (owned by another agent) to this exact contract:
+  // {"updatedAt":.., "conversations":[{id,title,project,mtime,messages}],
+  //  "history":[{title,url,domain,visits,lastVisit}]}. Same FileView idiom
+  // as the triage cache above, so it too is already parsed before the key
+  // is ever pressed. The file may not exist yet, or may be malformed --
+  // either degrades to root.omniboxIndex === null, which matchConversations/
+  // matchHistory already treat as "no results", i.e. exactly today's
+  // open-windows-only search.
+  property var omniboxIndex: null
+
+  FileView {
+    path: Quickshell.env("HOME") + "/.local/state/literate/omnibox-index.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      var d = null
+      try { d = JSON.parse(text()) } catch (e) { d = null }
+      root.omniboxIndex = (d && typeof d === "object"
+        && (d.conversations === undefined || Array.isArray(d.conversations))
+        && (d.history === undefined || Array.isArray(d.history))) ? d : null
+    }
+    onLoadFailed: root.omniboxIndex = null
+  }
+
   // Fire-and-forget action processes -- root.closeRequested() fires before
-  // either of these settles; neither result needs observing here.
+  // any of these settles; none of their results need observing here.
   Process { id: focusProc }
+  Process {
+    id: launchProc
+    // A bad exec_cmd dispatch fails on stderr with exit 0 -- same trap as
+    // the focus/move dispatches elsewhere in this file. Never drop this
+    // without logging it.
+    stderr: SplitParser {
+      onRead: function(line) {
+        if (String(line || "").trim()) console.warn("literate triage launch:", line)
+      }
+    }
+  }
   Process {
     id: moveProc
     stderr: SplitParser {
@@ -577,16 +835,25 @@ Item {
       required property var modelData
 
       readonly property bool isHeader: rowRoot.modelData.kind === "header"
-      readonly property bool hasCursor: root.selectableRows[root.cursor] === rowRoot.index
+      readonly property bool isWindow: rowRoot.modelData.kind === "window"
+      readonly property bool isTier: rowRoot.modelData.kind === "tier"
+      readonly property bool isConversation: rowRoot.modelData.kind === "conversation"
+      readonly property bool isHistory: rowRoot.modelData.kind === "history"
+      readonly property bool hasIconRow: rowRoot.isHeader || rowRoot.isConversation || rowRoot.isHistory
+      readonly property bool hasCursor: !rowRoot.isTier && root.selectableRows[root.cursor] === rowRoot.index
       // Whole-category scope cue: every row (header or window) belonging to
       // the category the cursor is currently in, so it's obvious at a glance
       // which windows a header-level move would take. Drawn under, and kept
       // subordinate to, the cursor's own highlight below -- the cursor row
-      // must still read as the primary selection.
-      readonly property bool inScopeCategory: rowRoot.modelData.categoryIndex === root.currentCategoryIndex
+      // must still read as the primary selection. categoryIndex is -1 for
+      // every non-open-tier row (tier labels, conversations, history), so
+      // the >= 0 guard keeps those from all lighting up together whenever
+      // the cursor happens to be sitting on one of them.
+      readonly property bool inScopeCategory: rowRoot.modelData.categoryIndex >= 0
+        && rowRoot.modelData.categoryIndex === root.currentCategoryIndex
 
       width: listView.width
-      height: rowRoot.isHeader ? root.catHeaderHeight : root.rowHeight
+      height: rowRoot.isTier ? Style.space(22) : (rowRoot.isHeader ? root.catHeaderHeight : root.rowHeight)
 
       Rectangle {
         anchors.fill: parent
@@ -602,16 +869,39 @@ Item {
         color: root.selectedBackground
       }
 
-      Row {
-        visible: rowRoot.isHeader
+      // Tier label ("OPEN"/"CONVERSATIONS"/"HISTORY") -- a heading, never a
+      // selectable row: no cursor rect, no MouseArea below picks it up.
+      Text {
+        visible: rowRoot.isTier
+        textFormat: Text.PlainText
         anchors.left: parent.left
         anchors.leftMargin: Style.space(10)
+        anchors.verticalCenter: parent.verticalCenter
+        text: rowRoot.isTier ? (rowRoot.modelData.label
+          + (rowRoot.modelData.total > rowRoot.modelData.shown
+             ? (" (showing " + rowRoot.modelData.shown + " of " + rowRoot.modelData.total + ")") : "")) : ""
+        color: root.foreground
+        opacity: 0.55
+        font.family: root.fontFamily
+        font.bold: true
+        font.pixelSize: Style.font.bodySmall
+        font.capitalization: Font.AllUppercase
+      }
+
+      Row {
+        visible: rowRoot.hasIconRow
+        anchors.left: parent.left
+        anchors.leftMargin: Style.space(10)
+        anchors.right: parent.right
+        anchors.rightMargin: Style.space(10)
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(6)
 
         Text {
-          visible: rowRoot.isHeader && root.glyph(rowRoot.modelData.icon) !== ""
-          text: rowRoot.isHeader ? root.glyph(rowRoot.modelData.icon) : ""
+          readonly property string iconName: rowRoot.isHeader ? rowRoot.modelData.icon
+            : (rowRoot.isConversation ? "chat-circle" : (rowRoot.isHistory ? "globe" : ""))
+          visible: rowRoot.hasIconRow && root.glyph(iconName) !== ""
+          text: root.glyph(iconName)
           color: rowRoot.hasCursor ? root.selectedText : root.foreground
           font.family: phosphor.font.family
           font.pixelSize: Style.font.body
@@ -619,25 +909,33 @@ Item {
 
         Text {
           textFormat: Text.PlainText
-          text: rowRoot.isHeader ? (rowRoot.modelData.name + " (" + rowRoot.modelData.count + ")") : ""
+          width: parent.width - Style.space(20)
+          text: rowRoot.isHeader ? (rowRoot.modelData.name + " (" + rowRoot.modelData.count + ")")
+            : rowRoot.isConversation ? (rowRoot.modelData.conversation.title
+                + (rowRoot.modelData.conversation.messages
+                   ? "  ·  " + rowRoot.modelData.conversation.messages + " msgs" : ""))
+            : rowRoot.isHistory ? (rowRoot.modelData.history.title
+                + (rowRoot.modelData.history.domain ? "  —  " + rowRoot.modelData.history.domain : ""))
+            : ""
           color: rowRoot.hasCursor ? root.selectedText : root.foreground
           font.family: root.fontFamily
-          font.bold: true
+          font.bold: rowRoot.isHeader
           font.pixelSize: Style.font.body
+          elide: Text.ElideRight
         }
       }
 
       Text {
-        visible: !rowRoot.isHeader
+        visible: rowRoot.isWindow
         textFormat: Text.PlainText
         anchors.left: parent.left
         anchors.leftMargin: Style.space(24)
         anchors.right: parent.right
         anchors.rightMargin: Style.space(10)
         anchors.verticalCenter: parent.verticalCenter
-        text: rowRoot.isHeader ? "" : ("[" + rowRoot.modelData.window.workspace + "] "
+        text: rowRoot.isWindow ? ("[" + rowRoot.modelData.window.workspace + "] "
               + rowRoot.modelData.window.class
-              + (rowRoot.modelData.window.title ? " — " + rowRoot.modelData.window.title : ""))
+              + (rowRoot.modelData.window.title ? " — " + rowRoot.modelData.window.title : "")) : ""
         color: rowRoot.hasCursor ? root.selectedText : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
@@ -646,6 +944,8 @@ Item {
 
       MouseArea {
         anchors.fill: parent
+        visible: !rowRoot.isTier
+        enabled: !rowRoot.isTier
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
         onEntered: root.selectRow(rowRoot.index)
