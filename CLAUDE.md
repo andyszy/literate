@@ -464,6 +464,20 @@ more often than a naming pass.
   rather than erroring, so it's worth spot-checking a real row's date after
   touching this.
 
+- Both sources are capped (`OMNIBOX_CONV_LIMIT`, `OMNIBOX_HISTORY_LIMIT`) so
+  the JSON stays small enough for a UI to hold in memory and filter locally.
+- The daemon also rebuilds the index opportunistically, the same shape as
+  `maybe_precompute_triage()`: `run_pass()` calls
+  `maybe_refresh_omnibox_index()` after every settled naming pass, which is
+  guarded by its own monotonic floor (`OMNIBOX_MIN_INTERVAL`) and a
+  near-stat-only change check (`_omnibox_changed()` -- *every* indexed
+  profile's History mtime, or any transcript newer than the index) so a quiet
+  desktop costs a handful of `stat()` calls plus one small JSON read, not a
+  rescan. Watching only the profile in front of you leaves the other one's
+  history stale until something unrelated triggers a rebuild. Set
+  `omnibox_index: false` to turn this off; `--index-omnibox` still works
+  standalone either way.
+
 ## `Default` is one Chrome profile, never the only one
 
 Sign a second Google account into Chrome and it gets its own directory beside
@@ -512,18 +526,51 @@ and puts the path in the row. Files are named by the hash of their contents, so
 the hundreds of pages sharing one site's icon share one file (2000 rows came to
 83 files, 332 KB here), and anything the current index no longer references is
 deleted on the next build. The directory tracks the index instead of growing.
-- Both sources are capped (`OMNIBOX_CONV_LIMIT`, `OMNIBOX_HISTORY_LIMIT`) so
-  the JSON stays small enough for a UI to hold in memory and filter locally.
-- The daemon also rebuilds the index opportunistically, the same shape as
-  `maybe_precompute_triage()`: `run_pass()` calls
-  `maybe_refresh_omnibox_index()` after every settled naming pass, which is
-  guarded by its own monotonic floor (`OMNIBOX_MIN_INTERVAL`) and a
-  near-stat-only change check (`_omnibox_changed()` -- *every* indexed
-  profile's History mtime, or any transcript newer than the index) so a quiet
-  desktop costs a handful of `stat()` calls plus one small JSON read, not a
-  rescan. Watching only the profile in front of you leaves the other one's
-  history stale until something unrelated triggers a rebuild. Set `omnibox_index: false` to
-  turn this off; `--index-omnibox` still works standalone either way.
+
+## The tab feed is one file per Chrome profile, not one file
+
+`chrome-tabs.json` was written by the literate-tabs extension's native host,
+and the extension is installed into **every** signed-in profile. Each copy
+connects its own host, every host wrote that one path, so the profiles took
+turns erasing each other and the live tab data flipped between accounts every
+few seconds. The tell is in `chrome-tabs-host.log`: two hosts starting and
+exiting, never one.
+
+**Chrome tells a native host nothing about the profile that launched it** --
+not in argv (just the extension origin), not in the environment: the browser
+process is shared. So the identity has to come from the extension, and
+`chrome.storage.local` is the one per-profile store it has without asking for
+anything the user sees. Extension 1.1 mints a random id there once and sends it
+as `instanceId`; the host writes `chrome-tabs.<instanceId>.json`, and
+`load_chrome_tabs()` globs `chrome-tabs*.json` and merges every fresh one.
+`"storage"` is a permission with no user-facing warning, which is why adding it
+does not make Chrome re-prompt or disable the extension.
+
+- **Repacking is not enough to deploy it.** `pack.sh` needs the `.pem` (present
+  here, gitignored), and Chrome only reinstalls an external extension when
+  `external_version` in `/opt/google/chrome/extensions/<id>.json` increases --
+  which is root, i.e. `sudo install.sh`, and then a full Chrome restart. Bump
+  the manifest version or the new code simply never loads.
+- Until that happens, hosts that get no `instanceId` **cooperate** on the
+  shared file rather than overwriting it (`merge_shared()` in the host, under
+  an `flock`): each window carries its own `updatedAt`, ours replace any
+  earlier copy of the same window id, and everyone else's are carried forward
+  while still fresh. So the collision is fixed without the new extension. Its
+  one cost, and the reason a per-instance file is still the real answer: a
+  window *we* closed is indistinguishable from another profile's window, so it
+  lingers until it ages out instead of disappearing at once.
+- Per-instance files outlive their instance (a profile deleted, storage
+  cleared), and nothing else would ever remove them, so the host prunes any it
+  has not seen written for a week.
+- **Ties in `match_chrome_windows()` got more likely, not less.** Title is
+  still the only thing a Hyprland window and a reported window share, and now
+  the same title can be reported twice for reasons that have nothing to do with
+  two identical windows being open: the same doc in both accounts, or a closed
+  window on the shared file that has not aged out. `_pick_chrome_window()`
+  prefers the freshest report -- a title still being re-pushed is the live one.
+  Equally fresh and genuinely different stays unmatched, as it always did; when
+  the tab lists are byte-identical it matches, because nothing the caller reads
+  could differ.
 
 ## Privacy
 

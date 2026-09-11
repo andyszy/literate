@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for the daemon's Chrome data layer: profile enumeration, the
-multi-profile omnibox history merge, and the per-profile favicon cache.
+multi-profile omnibox history merge, the per-profile favicon cache, and the
+merge of the literate-tabs extension's per-instance tab files.
 
     python3 tools/test-chrome.py
 
@@ -12,7 +13,10 @@ SourceFileLoader rather than imported.
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sqlite3
+import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -32,6 +36,10 @@ def load_daemon():
 
 
 namer = load_daemon()
+# The daemon logs to the live ~/.local/state/literate/daemon.log; a test run has
+# no business appending to the log someone tails to watch the real thing.
+_LOG = tempfile.NamedTemporaryFile(prefix="literate-test-", suffix=".log", delete=False)
+namer.LOG_PATH = Path(_LOG.name)
 
 
 def make_history(path, rows):
@@ -318,6 +326,191 @@ class TestFavicons(ChromeDirTest):
     def test_a_missing_favicons_database_costs_nothing(self):
         rows = self.attach([self.row("example.com", "Default")])
         self.assertNotIn("favicon", rows[0])
+
+
+class TestTabFileMerge(unittest.TestCase):
+    """load_chrome_tabs() merges one file per extension instance."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.now = 1_000_000.0
+
+    def write(self, name, payload):
+        (self.dir / name).write_text(json.dumps(payload))
+
+    def report(self, instance, windows, age=0.0):
+        return {"instanceId": instance, "updatedAt": self.now - age, "windows": windows}
+
+    @staticmethod
+    def window(wid, title, updated=None):
+        win = {"id": wid, "activeTitle": title,
+               "tabs": [{"title": title, "url": f"https://example.com/{wid}", "active": True}]}
+        if updated is not None:
+            win["updatedAt"] = updated
+        return win
+
+    def load(self):
+        return namer.load_chrome_tabs(state_dir=self.dir, now=self.now)
+
+    def test_both_profiles_are_visible_at_once(self):
+        self.write("chrome-tabs.aaa.json", self.report("aaa", [self.window(1, "personal")]))
+        self.write("chrome-tabs.bbb.json", self.report("bbb", [self.window(2, "work")]))
+        titles = sorted(w["activeTitle"] for w in self.load())
+        self.assertEqual(titles, ["personal", "work"])
+
+    def test_a_stale_file_is_ignored(self):
+        self.write("chrome-tabs.aaa.json", self.report("aaa", [self.window(1, "live")]))
+        self.write("chrome-tabs.bbb.json",
+                   self.report("bbb", [self.window(2, "gone")],
+                               age=namer.CHROME_TABS_MAX_AGE + 1))
+        self.assertEqual([w["activeTitle"] for w in self.load()], ["live"])
+
+    def test_the_legacy_single_file_still_reads(self):
+        self.write("chrome-tabs.json", {"updatedAt": self.now,
+                                        "windows": [self.window(1, "old host")]})
+        self.assertEqual([w["activeTitle"] for w in self.load()], ["old host"])
+
+    def test_a_window_stale_inside_a_fresh_file_is_dropped(self):
+        # The shared-file path gives each window its own updatedAt, so one
+        # instance's closed window ages out without taking the file with it.
+        self.write("chrome-tabs.json", {
+            "updatedAt": self.now,
+            "windows": [self.window(1, "live", updated=self.now),
+                        self.window(2, "closed", updated=self.now - namer.CHROME_TABS_MAX_AGE - 1)],
+        })
+        self.assertEqual([w["activeTitle"] for w in self.load()], ["live"])
+
+    def test_the_same_window_reported_twice_is_deduplicated(self):
+        self.write("chrome-tabs.json", {"updatedAt": self.now - 30,
+                                        "windows": [self.window(7, "stale title")]})
+        self.write("chrome-tabs.aaa.json", self.report("aaa", [self.window(7, "fresh title")]))
+        windows = self.load()
+        self.assertEqual([w["activeTitle"] for w in windows], ["fresh title"])
+
+    def test_nothing_fresh_reads_as_no_report_at_all(self):
+        self.write("chrome-tabs.aaa.json",
+                   self.report("aaa", [self.window(1, "x")], age=namer.CHROME_TABS_MAX_AGE + 1))
+        self.assertIsNone(self.load())
+        self.assertIsNone(namer.load_chrome_tabs(state_dir=self.dir / "nope", now=self.now))
+
+
+class TestMatchChromeWindows(unittest.TestCase):
+
+    @staticmethod
+    def win(title, url, instance="aaa", updated=100.0):
+        return {"activeTitle": title, "instance": instance, "updatedAt": updated,
+                "tabs": [{"title": title, "url": url, "active": True}]}
+
+    def test_unambiguous_titles_still_match(self):
+        windows = [self.win("Gmail", "https://mail.google.com/")]
+        self.assertEqual(namer.match_chrome_windows([(0, "Gmail")], windows),
+                         {0: windows[0]})
+
+    def test_the_same_title_in_two_profiles_prefers_the_fresher_report(self):
+        old = self.win("Untitled document", "https://docs.google.com/1", "aaa", 100.0)
+        new = self.win("Untitled document", "https://docs.google.com/2", "bbb", 160.0)
+        matched = namer.match_chrome_windows([(0, "Untitled document")], [old, new])
+        self.assertEqual(matched, {0: new})
+
+    def test_an_equally_fresh_tie_is_left_unmatched(self):
+        a = self.win("New Tab", "https://a.example/", "aaa", 100.0)
+        b = self.win("New Tab", "https://b.example/", "bbb", 100.0)
+        self.assertEqual(namer.match_chrome_windows([(0, "New Tab")], [a, b]), {})
+
+    def test_an_equally_fresh_tie_whose_tabs_are_identical_matches(self):
+        # Two reports of the same window content: whichever is picked, every
+        # field the caller reads is the same, so there is nothing to guess.
+        a = self.win("Gmail", "https://mail.google.com/", "aaa", 100.0)
+        b = self.win("Gmail", "https://mail.google.com/", "bbb", 100.0)
+        self.assertEqual(namer.match_chrome_windows([(0, "Gmail")], [a, b]), {0: a})
+
+    def test_two_hyprland_windows_with_one_title_stay_unmatched(self):
+        windows = [self.win("Gmail", "https://mail.google.com/")]
+        self.assertEqual(
+            namer.match_chrome_windows([(0, "Gmail"), (1, "Gmail")], windows), {})
+
+
+HOST = Path.home() / ".config/omarchy/chrome-extensions/literate-tabs-host"
+
+
+@unittest.skipUnless(HOST.exists(), f"native messaging host not installed at {HOST}")
+class TestNativeHost(unittest.TestCase):
+    """The other half of the join, driven for real: the host binary Chrome
+    launches, fed Chrome's own framing on stdin. One host process per profile
+    is exactly how Chrome runs it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.state = self.home / ".local/state/literate"
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_host(self, *messages):
+        """One host process, given these messages, then a closed pipe -- the
+        same shape as a profile's extension connecting and going away."""
+        payload = b"".join(
+            struct.pack("<I", len(body)) + body
+            for body in (json.dumps(m).encode() for m in messages))
+        env = {**os.environ, "HOME": str(self.home)}
+        done = subprocess.run([sys.executable, str(HOST)], input=payload,
+                              capture_output=True, env=env, timeout=30)
+        self.assertEqual(done.stdout, b"", "a host must never write to stdout")
+        return done
+
+    @staticmethod
+    def message(instance, wid, title):
+        body = {"windows": [{"id": wid, "activeTitle": title,
+                             "tabs": [{"title": title, "url": f"https://example.com/{wid}",
+                                       "active": True}]}]}
+        if instance:
+            body["instanceId"] = instance
+        return body
+
+    def titles(self):
+        windows = namer.load_chrome_tabs(state_dir=self.state) or []
+        return sorted(w["activeTitle"] for w in windows)
+
+    def test_two_instances_write_two_files_and_both_are_seen(self):
+        self.run_host(self.message("aaaa1111", 1, "personal"))
+        self.run_host(self.message("bbbb2222", 2, "work"))
+        self.assertEqual(sorted(p.name for p in self.state.glob("chrome-tabs*.json")),
+                         ["chrome-tabs.aaaa1111.json", "chrome-tabs.bbbb2222.json"])
+        self.assertEqual(self.titles(), ["personal", "work"])
+
+    def test_an_instance_replaces_only_its_own_file(self):
+        self.run_host(self.message("aaaa1111", 1, "personal"))
+        self.run_host(self.message("bbbb2222", 2, "work"))
+        self.run_host(self.message("aaaa1111", 1, "personal, renamed"))
+        self.assertEqual(self.titles(), ["personal, renamed", "work"])
+
+    def test_hosts_with_no_instance_id_share_the_file_instead_of_erasing_it(self):
+        # Extension 1.0 in two profiles: this is the bug, driven for real.
+        self.run_host(self.message(None, 1, "personal"))
+        self.run_host(self.message(None, 2, "work"))
+        self.assertEqual([p.name for p in self.state.glob("chrome-tabs*.json")],
+                         ["chrome-tabs.json"])
+        self.assertEqual(self.titles(), ["personal", "work"])
+
+    def test_a_shared_window_is_updated_in_place_not_duplicated(self):
+        self.run_host(self.message(None, 1, "personal"))
+        self.run_host(self.message(None, 2, "work"))
+        self.run_host(self.message(None, 1, "personal, navigated"))
+        self.assertEqual(self.titles(), ["personal, navigated", "work"])
+
+    def test_a_malformed_frame_does_not_take_the_state_with_it(self):
+        self.run_host(self.message("aaaa1111", 1, "personal"))
+        env = {**os.environ, "HOME": str(self.home)}
+        subprocess.run([sys.executable, str(HOST)], input=struct.pack("<I", 40) + b"{not json",
+                       capture_output=True, env=env, timeout=30)
+        self.assertEqual(self.titles(), ["personal"])
+
+    def test_an_instance_id_is_never_taken_straight_into_a_path(self):
+        self.run_host(self.message("../../../etc/passwd", 1, "sneaky"))
+        # Rejected as an id, so it took the shared path instead.
+        self.assertEqual([p.name for p in self.state.glob("chrome-tabs*.json")],
+                         ["chrome-tabs.json"])
 
 
 if __name__ == "__main__":
