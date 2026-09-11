@@ -87,6 +87,15 @@ CHROME_CLASSES = {"google-chrome", "google-chrome-beta", "google-chrome-unstable
 # tabs) plus past Claude Code transcripts, so the QML UI can search across
 # both. No model call, so it can run far more often than a naming pass.
 OMNIBOX_INDEX_PATH = STATE_DIR / "omnibox-index.json"
+# Chrome keeps favicons as PNG blobs inside a sqlite database no QML Image can
+# open, so the indexer unpacks the ones it actually references into plain files
+# here and puts the path in the row. Deduplicated by content hash (one PNG, not
+# one per page) and pruned to what the current index uses, so the directory
+# tracks the index rather than growing forever.
+FAVICON_DIR = STATE_DIR / "favicons"
+# Bigger is better up to here; past it a favicon is bytes nobody sees, because
+# every surface that draws one draws it small.
+FAVICON_MAX_WIDTH = 64
 CLAUDE_PROJECTS_DIR = HOME / ".claude/projects"
 # Chrome keeps one directory per signed-in profile under here, each with its
 # own History and Favicons database. "Default" is only the *first* profile,
@@ -240,6 +249,14 @@ def write_atomic(path, payload):
     """FileView is watching this path; never let it see a half-written file."""
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    tmp.replace(path)
+
+
+def write_bytes_atomic(path, data):
+    """Same tmp+rename contract as write_atomic(), for the binary files
+    (favicon PNGs) a UI may be loading while the index rebuilds."""
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_bytes(data)
     tmp.replace(path)
 
 
@@ -1220,11 +1237,117 @@ def build_history(limit=OMNIBOX_HISTORY_LIMIT, profiles=None,
     return [entry for _score, entry in kept[:limit]]
 
 
+def _icon_rank(width):
+    """Sort key for competing bitmaps of one site's favicon: bigger wins up to
+    FAVICON_MAX_WIDTH, and past that smaller wins."""
+    width = width or 0
+    return (width <= FAVICON_MAX_WIDTH, width if width <= FAVICON_MAX_WIDTH else -width)
+
+
+def read_profile_favicons(directory):
+    """{host: PNG bytes} for one Chrome profile's favicon cache.
+
+    `icon_mapping` says which page URL used which icon and `favicon_bitmaps`
+    holds the images, so the join gives page URL -> image; this keys the result
+    by *host*, because that is the granularity a favicon actually has and the
+    granularity a history row can be looked up at. Same read-only immutable=1
+    open as History: Favicons is Chrome's live database too.
+
+    Failure yields {} rather than raising -- an icon is decoration, and no row
+    should be lost over one.
+    """
+    db = CHROME_DIR / directory / "Favicons"
+    if not db.exists():
+        return {}
+    try:
+        con = sqlite_immutable(db)
+        try:
+            rows = con.execute(
+                "SELECT im.page_url, fb.width, fb.image_data "
+                "FROM icon_mapping im JOIN favicon_bitmaps fb ON fb.icon_id = im.icon_id "
+                "WHERE length(fb.image_data) > 0").fetchall()
+        finally:
+            con.close()
+    except Exception as e:
+        log(f"omnibox: chrome favicons unavailable for {directory!r}:", e)
+        return {}
+
+    best = {}
+    for page_url, width, data in rows:
+        host = registrable_domain(page_url).lower()
+        data = bytes(data)
+        # Chrome writes PNG here; anything else is a format this cache was not
+        # promised and a QML Image would fail on silently.
+        if not host or not data.startswith(b"\x89PNG"):
+            continue
+        for key in (host, host[4:] if host.startswith("www.") else None):
+            if not key:
+                continue
+            current = best.get(key)
+            if current is None or _icon_rank(width) > _icon_rank(current[0]):
+                best[key] = (width or 0, data)
+    return {host: data for host, (_w, data) in best.items()}
+
+
+def attach_favicons(entries, profiles=None, directory=FAVICON_DIR):
+    """Give each history row the path to a PNG of its site's icon.
+
+    A row is looked up in **its own profile's cache first**: two accounts
+    signed into the same site can legitimately hold different icons, and the
+    row belongs to one of them. Only if its own profile has never seen the site
+    do the other profiles get asked -- an icon from the wrong cache still beats
+    a blank square.
+
+    Files are named by the hash of their contents, so the hundreds of pages
+    sharing one site's icon share one file, and anything the current index no
+    longer references is deleted. Rows with no icon anywhere simply have no
+    `favicon` key.
+    """
+    if not entries:
+        return
+    order = [d for d, _name in chrome_profile_dirs(profiles)]
+    caches = {}
+
+    def cache_for(source):
+        # Read lazily: a profile is only worth a sqlite open once some row has
+        # actually failed to find its icon closer to home.
+        if source not in caches:
+            caches[source] = read_profile_favicons(source)
+        return caches[source]
+
+    directory.mkdir(parents=True, exist_ok=True)
+    used = set()
+    for row in entries:
+        own = row.get("profile")
+        host = (row.get("domain") or "").lower()
+        for source in [own] + [d for d in order if d != own]:
+            data = cache_for(source).get(host) if source else None
+            if data is None:
+                continue
+            digest = hashlib.sha1(data).hexdigest()
+            path = directory / f"{digest}.png"
+            if digest not in used:
+                used.add(digest)
+                if not path.exists():
+                    write_bytes_atomic(path, data)
+            row["favicon"] = str(path)
+            break
+
+    for path in directory.glob("*.png"):
+        if path.stem not in used:
+            path.unlink(missing_ok=True)  # no row points at it any more
+
+
 def build_omnibox_index(profiles=None):
+    history = build_history(profiles=profiles)
+    try:
+        attach_favicons(history, profiles)
+    except Exception as e:  # decoration: never lose an index over an icon
+        log("omnibox: favicons failed:", e)
     return {
         "updatedAt": int(time.time()),
         "conversations": build_conversations(),
-        "history": build_history(profiles=profiles),
+        "history": history,
     }
 
 

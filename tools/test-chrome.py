@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for the daemon's Chrome data layer: profile enumeration, the
-multi-profile omnibox history merge.
+multi-profile omnibox history merge, and the per-profile favicon cache.
 
     python3 tools/test-chrome.py
 
@@ -46,6 +46,31 @@ def make_history(path, rows):
                 "hidden INTEGER DEFAULT 0)")
     con.executemany("INSERT INTO urls (url, title, visit_count, last_visit_time, hidden) "
                     "VALUES (?, ?, ?, ?, ?)", rows)
+    con.commit()
+    con.close()
+
+
+PNG = b"\x89PNG\r\n\x1a\n"
+
+
+def make_favicons(path, rows):
+    """A minimal stand-in for Chrome's Favicons database. `rows` are
+    (page_url, width, image_data)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE icon_mapping (id INTEGER PRIMARY KEY, "
+                "page_url LONGVARCHAR NOT NULL, icon_id INTEGER, "
+                "page_url_type INTEGER DEFAULT 0)")
+    con.execute("CREATE TABLE favicon_bitmaps (id INTEGER PRIMARY KEY, "
+                "icon_id INTEGER NOT NULL, last_updated INTEGER DEFAULT 0, "
+                "image_data BLOB, width INTEGER DEFAULT 0, height INTEGER DEFAULT 0, "
+                "last_requested INTEGER DEFAULT 0)")
+    for icon_id, (page_url, width, data) in enumerate(rows, start=1):
+        con.execute("INSERT INTO icon_mapping (page_url, icon_id) VALUES (?, ?)",
+                    (page_url, icon_id))
+        con.execute("INSERT INTO favicon_bitmaps (icon_id, image_data, width) "
+                    "VALUES (?, ?, ?)", (icon_id, data, width))
     con.commit()
     con.close()
 
@@ -219,6 +244,80 @@ class TestHistoryMerge(ChromeDirTest):
 
     def test_no_chrome_at_all_yields_no_rows(self):
         self.assertEqual(namer.build_history(), [])
+
+
+class TestFavicons(ChromeDirTest):
+
+    def setUp(self):
+        super().setUp()
+        self.write_local_state({"Default": {"name": "Andy"},
+                                "Profile 1": {"name": "work"}})
+        make_history(self.chrome / "Default" / "History", [])
+        make_history(self.chrome / "Profile 1" / "History", [])
+        self.icons = Path(self.tmp.name) / "favicons"
+
+    @staticmethod
+    def row(domain, profile):
+        return {"domain": domain, "profile": profile, "url": f"https://{domain}/"}
+
+    def attach(self, entries):
+        namer.attach_favicons(entries, directory=self.icons)
+        return entries
+
+    def read(self, entry):
+        return Path(entry["favicon"]).read_bytes()
+
+    def test_a_row_takes_its_own_profile_s_icon_first(self):
+        # The same site, signed in twice, with a different icon each side.
+        make_favicons(self.chrome / "Default" / "Favicons",
+                      [("https://mail.google.com/", 32, PNG + b"personal")])
+        make_favicons(self.chrome / "Profile 1" / "Favicons",
+                      [("https://mail.google.com/", 32, PNG + b"work")])
+        rows = self.attach([self.row("mail.google.com", "Default"),
+                            self.row("mail.google.com", "Profile 1")])
+        self.assertEqual(self.read(rows[0]), PNG + b"personal")
+        self.assertEqual(self.read(rows[1]), PNG + b"work")
+
+    def test_another_profile_s_icon_beats_a_blank_square(self):
+        make_favicons(self.chrome / "Default" / "Favicons",
+                      [("https://github.com/anything", 32, PNG + b"octocat")])
+        make_favicons(self.chrome / "Profile 1" / "Favicons", [])
+        rows = self.attach([self.row("github.com", "Profile 1")])
+        self.assertEqual(self.read(rows[0]), PNG + b"octocat")
+
+    def test_one_file_per_image_however_many_rows_share_it(self):
+        make_favicons(self.chrome / "Default" / "Favicons",
+                      [("https://github.com/a", 32, PNG + b"octocat")])
+        rows = self.attach([self.row("github.com", "Default") for _ in range(5)])
+        self.assertEqual(len({r["favicon"] for r in rows}), 1)
+        self.assertEqual(len(list(self.icons.glob("*.png"))), 1)
+
+    def test_the_widest_bitmap_under_the_ceiling_wins(self):
+        make_favicons(self.chrome / "Default" / "Favicons", [
+            ("https://example.com/", 16, PNG + b"small"),
+            ("https://example.com/", 32, PNG + b"right"),
+            ("https://example.com/", 512, PNG + b"huge"),
+        ])
+        rows = self.attach([self.row("example.com", "Default")])
+        self.assertEqual(self.read(rows[0]), PNG + b"right")
+
+    def test_an_icon_no_row_points_at_any_more_is_deleted(self):
+        make_favicons(self.chrome / "Default" / "Favicons",
+                      [("https://old.example/", 32, PNG + b"old"),
+                       ("https://new.example/", 32, PNG + b"new")])
+        self.attach([self.row("old.example", "Default")])
+        self.attach([self.row("new.example", "Default")])
+        self.assertEqual([p.read_bytes() for p in self.icons.glob("*.png")], [PNG + b"new"])
+
+    def test_a_blob_that_is_not_a_png_is_skipped(self):
+        make_favicons(self.chrome / "Default" / "Favicons",
+                      [("https://example.com/", 32, b"GIF89a nope")])
+        rows = self.attach([self.row("example.com", "Default")])
+        self.assertNotIn("favicon", rows[0])
+
+    def test_a_missing_favicons_database_costs_nothing(self):
+        rows = self.attach([self.row("example.com", "Default")])
+        self.assertNotIn("favicon", rows[0])
 
 
 if __name__ == "__main__":
