@@ -479,6 +479,7 @@ class Namer:
         self.triage_lock = threading.Lock()
         self.triage_sig = None
         self.triage_at = float("-inf")
+        self.triage_retry = None
         self.timer = None
         self.first_event = None
         self.last_sigs = {}
@@ -988,7 +989,19 @@ class Namer:
         now = time.monotonic()
         wait = self.cfg["triage_min_interval"] - (now - self.triage_at)
         if wait > 0:
-            log(f"triage precompute skipped ({wait:.0f}s under the {self.cfg['triage_min_interval']:.0f}s floor)")
+            # Not a poll: this re-runs the pass for a change that has already
+            # happened, once, after the floor expires. Without it a burst of
+            # changes followed by quiet would leave the cache stale until the
+            # next Hyprland event -- which on an idle desktop is never, and
+            # the next triage key would pay the full round-trip.
+            log(f"triage precompute deferred {wait:.0f}s (under the "
+                f"{self.cfg['triage_min_interval']:.0f}s floor)")
+            with self.lock:
+                if self.triage_retry:
+                    self.triage_retry.cancel()
+                self.triage_retry = threading.Timer(wait + 0.5, self.fire)
+                self.triage_retry.daemon = True
+                self.triage_retry.start()
             return
         if not self.triage_lock.acquire(blocking=False):
             return
