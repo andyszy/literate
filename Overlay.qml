@@ -97,6 +97,12 @@ Item {
       root.suggestedWindows = []
       root.groups = []
       triageView.open()
+      // SUPER+SHIFT+<n> ("move category to workspace N") is a GLOBAL
+      // Hyprland bind, so the compositor would consume it before triage (a
+      // plain Wayland client) ever sees the keypress. Shadow it for as long
+      // as triage is open via the "literate-triage" submap defined in
+      // bindings.lua; close() resets it on every exit path. See CLAUDE.md.
+      root.enterTriageSubmap()
     } else {
       root.workspaceId = String(payload.workspace || "")
       root.windowCount = -1
@@ -129,9 +135,39 @@ Item {
     suggestTimeoutTimer.stop()
     if (suggestProc.running) suggestProc.running = false
     if (root.triageMode) triageView.close()
+    // Belt-and-braces: reset unconditionally on every close path (Escape,
+    // Enter/activate, scrim click, IPC hide, this function in general).
+    // Dispatching a submap reset when not in one is harmless, and being
+    // stuck in a submap with only 9 chords working is a much worse failure
+    // than one redundant dispatch. See also Component.onDestruction below.
+    root.resetTriageSubmap()
   }
 
   function ping() { return "ok" }
+
+  // IPC entry point for the SUPER+SHIFT+<n> binds in the "literate-triage"
+  // Hyprland submap (see bindings.lua): moves the highlighted row's whole
+  // category to workspace `arg`, then closes -- what pressing digit N used
+  // to do directly, before digits became Triage.qml's search box. Lives
+  // here rather than on Triage.qml because only this Item is the manifest
+  // entry point the host (and `omarchy-shell shell call`) can reach.
+  function triageMove(arg) {
+    if (!root.opened || !root.triageMode) return "not in triage"
+    triageView.moveCurrentCategory(String(arg))
+    return "ok"
+  }
+
+  function enterTriageSubmap() {
+    submapProc.command = ["hyprctl", "dispatch", 'hl.dsp.submap("literate-triage")']
+    submapProc.running = true
+  }
+
+  function resetTriageSubmap() {
+    submapProc.command = ["hyprctl", "dispatch", 'hl.dsp.submap("reset")']
+    submapProc.running = true
+  }
+
+  Component.onDestruction: root.resetTriageSubmap()
 
   // Resolve this component's own directory rather than trusting PATH --
   // Qt.resolvedUrl resolves relative to the QML file it's evaluated in.
@@ -433,6 +469,16 @@ Item {
   // Fire-and-forget action processes. The overlay closes the instant one of
   // these starts; none of them need their result observed here.
   Process { id: renameProc }
+  Process {
+    id: submapProc
+    // A bad submap dispatch fails on stderr with exit 0 -- same trap as the
+    // window-move dispatches below. Never drop this without logging it.
+    stderr: SplitParser {
+      onRead: function(line) {
+        if (String(line || "").trim()) console.warn("literate triage submap:", line)
+      }
+    }
+  }
   Process {
     id: spinOutProc
     // A bad dispatch prints to stderr and exits 0, so without this the whole

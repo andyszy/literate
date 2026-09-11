@@ -43,6 +43,21 @@ Item {
   property var windows: []      // [{index, address, class, title, workspace}]
   property int cursor: 0        // position within selectableRows, not rows
 
+  // Incremental search: plain substring, case-insensitive, matched against
+  // category name / window class / window title independently. See
+  // computeRows() below for how a query reshapes the grouped list.
+  property string query: ""
+
+  function setQuery(text) {
+    if (root.query === text) return
+    root.query = text
+    root.cursor = 0 // first visible row, every time the query changes
+  }
+
+  function matchesQuery(haystack) {
+    return String(haystack || "").toLowerCase().indexOf(root.query.toLowerCase()) >= 0
+  }
+
   function open() {
     root.loading = true
     root.failed = false
@@ -50,6 +65,7 @@ Item {
     root.categories = []
     root.windows = []
     root.cursor = 0
+    root.query = ""
     proc.command = [root.binPath, "--triage"]
     proc.running = true
     timeoutTimer.restart()
@@ -75,19 +91,47 @@ Item {
 
   readonly property var rows: root.computeRows()
 
+  // With no query this is exactly the old flat list. With one, a category
+  // whose OWN name matches keeps every window (the match already explains
+  // the whole group); otherwise only the windows that individually match
+  // survive, and a category left with none is dropped rather than shown
+  // with an empty body.
   function computeRows() {
     var out = []
+    var hasQuery = root.query.length > 0
     for (var c = 0; c < root.categories.length; c++) {
       var cat = root.categories[c]
-      out.push({ kind: "header", categoryIndex: c, name: cat.name, icon: cat.icon,
-                 count: (cat.indices || []).length })
       var indices = cat.indices || []
-      for (var i = 0; i < indices.length; i++) {
-        var w = root.windowByIndex(indices[i])
-        if (w) out.push({ kind: "window", categoryIndex: c, window: w })
+      var visible = indices
+      if (hasQuery && !root.matchesQuery(cat.name)) {
+        visible = []
+        for (var i = 0; i < indices.length; i++) {
+          var w = root.windowByIndex(indices[i])
+          if (w && (root.matchesQuery(w.class) || root.matchesQuery(w.title)))
+            visible.push(indices[i])
+        }
+      }
+      if (hasQuery && visible.length === 0) continue
+
+      out.push({ kind: "header", categoryIndex: c, name: cat.name, icon: cat.icon,
+                 count: visible.length })
+      for (var j = 0; j < visible.length; j++) {
+        var win = root.windowByIndex(visible[j])
+        if (win) out.push({ kind: "window", categoryIndex: c, window: win })
       }
     }
     return out
+  }
+
+  readonly property int visibleWindowCount: {
+    var n = 0
+    for (var i = 0; i < root.rows.length; i++) if (root.rows[i].kind === "window") n++
+    return n
+  }
+  readonly property int visibleCategoryCount: {
+    var n = 0
+    for (var i = 0; i < root.rows.length; i++) if (root.rows[i].kind === "header") n++
+    return n
   }
 
   readonly property var selectableRows: root.computeSelectableRows()
@@ -134,6 +178,10 @@ Item {
     root.closeRequested()
   }
 
+  // Invoked from Overlay.qml's triageMove(arg) IPC entry point, driven by
+  // the SUPER+SHIFT+<n> binds in the "literate-triage" Hyprland submap (see
+  // bindings.lua) -- not from handleKey() any more, since plain digits now
+  // feed the search box.
   function moveCurrentCategory(target) {
     var row = root.currentRow()
     if (!row) return
@@ -160,22 +208,34 @@ Item {
   // ------------------------------------------------------------------- keys
   //
   // Called from Overlay.qml's keyCatcher when root.triageMode is true.
-
+  //
+  // Digits and letters all feed the search box now (moving a category to a
+  // workspace moved to SUPER+SHIFT+<n>, shadowed in via the "literate-triage"
+  // Hyprland submap -- see triageMove() below and bindings.lua), so the only
+  // keys left for navigation are the plain arrows: j/k would otherwise be
+  // untypeable in a query. Escape mirrors Menu.qml:1132 -- clear the filter
+  // first, only close once it is already empty.
   function handleKey(event) {
     if (event.key === Qt.Key_Escape) {
-      root.closeRequested()
+      if (root.query) root.setQuery("")
+      else root.closeRequested()
       event.accepted = true
-    } else if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
+    } else if (event.key === Qt.Key_Up) {
       root.select(-1)
       event.accepted = true
-    } else if (event.key === Qt.Key_Down || event.key === Qt.Key_J) {
+    } else if (event.key === Qt.Key_Down) {
       root.select(1)
       event.accepted = true
     } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
       root.focusCurrent()
       event.accepted = true
-    } else if (event.key >= Qt.Key_1 && event.key <= Qt.Key_9) {
-      root.moveCurrentCategory(String(event.key - Qt.Key_0))
+    } else if (Util.editsFilter(event, root.query)) {
+      root.setQuery(Util.editedFilter(event, root.query))
+      event.accepted = true
+    } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32
+        && event.text.charCodeAt(0) !== 127
+        && (event.modifiers === Qt.NoModifier || event.modifiers === Qt.ShiftModifier)) {
+      root.setQuery(root.query + event.text)
       event.accepted = true
     }
   }
@@ -300,10 +360,14 @@ Item {
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      text: "Triage" + (root.windows.length > 0
-        ? (" · " + root.windows.length + (root.windows.length === 1 ? " window" : " windows")
-           + " · " + root.categories.length + (root.categories.length === 1 ? " category" : " categories"))
-        : "")
+      text: root.query.length > 0
+        ? ("Search: " + root.query + "▮"
+           + " · " + root.visibleWindowCount + (root.visibleWindowCount === 1 ? " window" : " windows")
+           + " · " + root.visibleCategoryCount + (root.visibleCategoryCount === 1 ? " category" : " categories"))
+        : ("Triage" + (root.windows.length > 0
+            ? (" · " + root.windows.length + (root.windows.length === 1 ? " window" : " windows")
+               + " · " + root.categories.length + (root.categories.length === 1 ? " category" : " categories"))
+            : ""))
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.heading
@@ -366,6 +430,22 @@ Item {
       font.pixelSize: Style.font.bodySmall
       elide: Text.ElideRight
     }
+  }
+
+  Text {
+    id: noMatches
+    textFormat: Text.PlainText
+    visible: root.query.length > 0 && root.rows.length === 0 && !root.loading && !root.failed
+    anchors.top: status.bottom
+    anchors.topMargin: Style.spacing.md
+    anchors.left: parent.left
+    anchors.right: parent.right
+    text: "No matches for “" + root.query + "”"
+    color: root.foreground
+    opacity: 0.7
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.body
+    elide: Text.ElideRight
   }
 
   ListView {
