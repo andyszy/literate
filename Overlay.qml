@@ -405,7 +405,6 @@ Item {
   property color foreground: Color.menu.text
   property color border: Color.menu.border
   property var borderSpec: Border.surfaceSpec("menu", "border", border, Math.max(1, Style.space(2)))
-  property color scrim: Color.menu.scrim
   property color selectedBackground: Color.menu.selectedBackground
   property color selectedText: Color.menu.selectedText
   readonly property int cornerRadius: Style.cornerRadius
@@ -510,14 +509,27 @@ Item {
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
     exclusionMode: ExclusionMode.Ignore
 
+    // No dimming scrim: CardShadow below does the depth work, and a scrim
+    // is redundant on top of it. Kept as a transparent Rectangle (rather
+    // than deleted) only as a visible marker of the backdrop's extent --
+    // the actual click-outside-to-close hit area is the independent
+    // MouseArea right below, which never read this Rectangle's colour and
+    // is unaffected by this change.
     Rectangle {
       anchors.fill: parent
-      color: root.scrim
+      color: "transparent"
     }
 
     MouseArea {
       anchors.fill: parent
       onClicked: root.close()
+    }
+
+    // Shared by the workspace action menu and the triage view below, since
+    // both render inside `card` -- see CardShadow.qml for why this is a
+    // separate item rather than an effect on `card` itself.
+    CardShadow {
+      target: card
     }
 
     BorderSurface {
