@@ -139,7 +139,9 @@ Item {
         visible = []
         for (var i = 0; i < indices.length; i++) {
           var w = root.windowByIndex(indices[i])
-          if (w && (root.matchesQuery(w.class) || root.matchesQuery(w.title)))
+          if (w && (root.matchesQuery(w.app) || root.matchesQuery(w.subject)
+                    || root.matchesQuery(w.host) || root.matchesQuery(w.context)
+                    || root.matchesQuery(w.class) || root.matchesQuery(w.title)))
             visible.push(indices[i])
         }
       }
@@ -941,9 +943,14 @@ Item {
         anchors.right: parent.right
         anchors.rightMargin: Style.space(10)
         anchors.verticalCenter: parent.verticalCenter
+        // The daemon resolves `app` (Gmail, Claude Code) and `subject` (the
+        // title with the app/account tail subtracted). Fall back to class and
+        // title only for a record written before that landed.
         text: rowRoot.isWindow ? ("[" + rowRoot.modelData.window.workspace + "] "
-              + rowRoot.modelData.window.class
-              + (rowRoot.modelData.window.title ? " — " + rowRoot.modelData.window.title : "")) : ""
+              + (rowRoot.modelData.window.app || rowRoot.modelData.window.class)
+              + ((rowRoot.modelData.window.subject || rowRoot.modelData.window.title)
+                 ? " — " + (rowRoot.modelData.window.subject || rowRoot.modelData.window.title) : "")
+              + (rowRoot.modelData.window.context ? "  ·  " + rowRoot.modelData.window.context : "")) : ""
         color: rowRoot.hasCursor ? root.selectedText : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
