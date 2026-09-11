@@ -316,9 +316,13 @@ it must stay in `tools/sync-upstream`'s `--exclude` list.
   workspace, **sorted** — hyprctl reorders its reply on focus changes and that
   is not a change. It is global, unlike the per-workspace naming cache, so one
   chatty title would otherwise re-ask about the whole desktop every debounce
-  window. `triage_min_interval` (30 s) is the floor that stops that; when it
-  bites, the cache goes stale and `--triage` falls back to a live call, which
-  is only ever as slow as the old behaviour. Set `triage_precompute: false` to
+  window. `triage_min_interval` (30 s) is the floor that stops that. When it
+  bites the precompute is *deferred* -- one `threading.Timer` re-runs the pass
+  once the floor expires, which is not a poll (the change has already
+  happened) and is what keeps a burst-then-quiet desktop from sitting on a
+  stale cache until the next Hyprland event, which on an idle machine is
+  never. Should even that miss, `--triage` just falls back to a live call,
+  which is only ever as slow as the old behaviour. Set `triage_precompute: false` to
   get exactly the old behaviour back.
 - `run_pass()` gathers `_filtered_clients()` once and derives both the naming
   snapshot (`group_by_workspace()`) and the triage window list
