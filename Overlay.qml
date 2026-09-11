@@ -127,9 +127,10 @@ Item {
       root.suggestedIcon = ""
       root.suggestedWindows = []
       root.groups = []
-      // "profile" arms which Chrome profile Enter opens links in for this
-      // invocation; absent, it is the configured primary.
-      triageView.open(payload.profile, payload.query)
+      // The whole payload: "target" (new|current), "query", and "profile",
+      // which arms the Chrome profile Enter opens links in for this
+      // invocation. Absent keys keep the defaults.
+      triageView.open(payload)
       // SUPER+SHIFT+<n> ("move category to workspace N") is a GLOBAL
       // Hyprland bind, so the compositor would consume it before triage (a
       // plain Wayland client) ever sees the keypress. Shadow it for as long

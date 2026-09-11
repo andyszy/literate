@@ -87,18 +87,55 @@ Item {
     return String(haystack || "").toLowerCase().indexOf(root.query.toLowerCase()) >= 0
   }
 
-  // An initial query may arrive on the summon payload
-  // ({"mode":"triage","query":"gm"}), the same way the shelf takes one: it is
-  // the only way to exercise the typed state without a keyboard, and
-  // summoning straight into an answer is the same view either way.
-  function open(armedProfile, initialQuery) {
-    root.armProfile(armedProfile)
+  // ------------------------------------------------------------- targeting
+  //
+  // Two chords, one surface: SUPER+T is "new tab" and SUPER+L is "focus the
+  // address bar of THIS window", which is the muscle memory every browser has
+  // already taught. The payload's "target" is the whole difference.
+  //
+  // "current" only means anything when a browser window had focus. On a
+  // terminal there is nothing to replace, and rather than invent a behaviour
+  // for that it falls back to opening a window and SAYS so on the row -- a
+  // chord that silently does nothing is worse than one that does the ordinary
+  // thing.
+  property string target: "new"
+  property string focusedClass: ""
+  property string focusedTitle: ""
+
+  function isBrowserClass(cls) {
+    var c = String(cls || "").toLowerCase()
+    // "google-chrome" is a tabbed window; "chrome-<host>__<path>-<Profile>" is
+    // an app-mode one, which is what every window here is becoming.
+    return c === "google-chrome" || c === "chromium" || c === "google-chrome-stable"
+      || c.indexOf("chrome-") === 0 || c.indexOf("google-chrome") === 0
+  }
+
+  readonly property bool canReplace: root.target === "current"
+    && root.isBrowserClass(root.focusedClass)
+
+  // An initial query and an armed profile may arrive on the summon payload
+  // ({"mode":"triage","query":"gm"}); a query is the only way to exercise the
+  // typed state without a keyboard, and summoning straight into an answer is
+  // the same view either way.
+  function open(payload) {
+    var p = payload || ({})
+    root.target = (String(p.target || "") === "current") ? "current" : "new"
+    root.focusedClass = ""
+    root.focusedTitle = ""
+    // Which window had focus BEFORE this surface took it. Hyprland still
+    // reports the real client while a layer surface holds the keyboard
+    // (verified), so this is exactly the window SUPER+L means.
+    if (root.target === "current") {
+      activeProc.command = ["hyprctl", "-j", "activewindow"]
+      activeProc.running = true
+    }
+    root.armProfile(p.profile)
     root.failed = false
     root.errorText = ""
     root.cursor = 0
     root.query = ""
     root.actionFocused = false
-    if (initialQuery) root.setQuery(String(initialQuery))
+    if (p.query) root.setQuery(String(p.query))
     // Paint the daemon's precomputed grouping in this frame rather than
     // waiting on a process to tell us the same thing. If it is still current
     // --triage confirms it in ~45ms and nothing moves; if the desktop has
@@ -329,9 +366,38 @@ Item {
     launchProc.running = true
   }
 
+  readonly property string commandPath:
+    Quickshell.env("HOME") + "/.local/state/literate/chrome-command.json"
+
+  // Ask the Chrome profile that owns the focused window to point it at `url`.
+  //
+  // Chrome has no command line for "navigate that window", and every profile
+  // runs in one browser process with one window class, so nothing on this side
+  // can even name the window. The literate-tabs extension can: the command
+  // goes to a file, every profile's native host forwards it, and only the
+  // profile holding a window with that title acts. Written tmp+rename so a
+  // host polling the file never reads half a command.
+  //
+  // The fallback -- spawn a replacement window and close the old one -- was
+  // rejected: it flickers, and it loses the window's place in the tiling
+  // layout, which is the one thing "in this window" is about.
+  function navigateFocused(url) {
+    var now = Date.now()
+    var payload = JSON.stringify({ id: now, issuedAt: now / 1000,
+      action: "navigate", url: url, title: root.focusedTitle })
+    commandProc.command = ["sh", "-c",
+      'printf %s "$1" > "$2.tmp" && mv "$2.tmp" "$2"', "sh", payload, root.commandPath]
+    commandProc.running = true
+  }
+
   // `secondary` is the Shift half of the chord, not a property of the row.
   // An empty url means "just a window", which is the empty-query action.
+  //
+  // Shift+Enter always opens a NEW window, even under SUPER+L: a tab cannot
+  // move between Chrome profiles, so "the other account, in this window" is
+  // not a thing that exists.
   function openUrlInBrowser(url, secondary) {
+    if (url && root.canReplace && !secondary) { root.navigateFocused(url); return }
     var profile = secondary ? root.shiftProfile : root.enterProfile
     var target = url ? (" " + Util.shellQuote(url)) : " --new-window"
     var cmd = (profile && profile.dir)
@@ -406,6 +472,16 @@ Item {
   // conversation or history row -- those get an Enter-only hint, so
   // SUPER+SHIFT+<n> reads as (and is, see moveCurrent()) a no-op rather
   // than something surprising.
+  // The pinned row's text, with what SUPER+L is about to do to it spelled out
+  // rather than left to be discovered.
+  function actionLabel() {
+    var base = root.queryAction ? root.queryAction.label : ""
+    if (!base || root.target !== "current" || !root.queryAction
+        || root.queryAction.kind === "window") return base
+    return base + (root.canReplace ? " — in this window"
+                                   : " — in a new window (nothing to replace)")
+  }
+
   // True when Enter would hand a URL to a browser, i.e. when the profile
   // question even arises.
   function opensInBrowser() {
@@ -422,6 +498,8 @@ Item {
     var primary = root.profileName(root.enterProfile)
     var secondary = root.profileName(root.shiftProfile)
     var suffix = (root.chromeProfiles.length > 2) ? " (⌃⇥ next)" : ""
+    if (root.opensInBrowser() && root.canReplace)
+      return "⏎ replace this window" + (secondary ? "    ⇧⏎ " + secondary + " (new window)" : "")
     if (root.opensInBrowser() && primary)
       return "⏎ " + primary + (secondary ? " · ⇧⏎ " + secondary : "") + suffix
     if (root.actionActive)
@@ -728,6 +806,26 @@ Item {
   // any of these settles; none of their results need observing here.
   Process { id: focusProc }
   Process {
+    id: activeProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var d = null
+        try { d = JSON.parse(text) } catch (e) { d = null }
+        root.focusedClass = (d && d.class) ? String(d.class) : ""
+        root.focusedTitle = (d && d.title) ? String(d.title) : ""
+      }
+    }
+  }
+  Process {
+    id: commandProc
+    stderr: SplitParser {
+      onRead: function(line) {
+        if (String(line || "").trim()) console.warn("literate triage command:", line)
+      }
+    }
+  }
+  Process {
     id: launchProc
     // A bad exec_cmd dispatch fails on stderr with exit 0 -- same trap as
     // the focus/move dispatches elsewhere in this file. Never drop this
@@ -1000,7 +1098,7 @@ Item {
       Text {
         textFormat: Text.PlainText
         width: parent.width - Style.space(20)
-        text: root.queryAction ? root.queryAction.label : ""
+        text: root.actionLabel()
         color: actionRow.fg
         font.family: root.fontFamily
         font.pixelSize: Style.font.body

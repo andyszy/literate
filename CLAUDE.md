@@ -374,6 +374,31 @@ it must stay in `tools/sync-upstream`'s `--exclude` list.
   and runs a little heavier. The outer geometry is FIXED while open (verified
   identical, 907x452 at 303,196, between the empty and typed states): a box
   that resizes on every keystroke is unsettling to type into.
+- **Two chords, one surface: `target` decides.** `{"mode":"triage","target":
+  "new"}` (SUPER+T) opens what you pick in a new window; `"current"`
+  (SUPER+L) replaces the window that had focus, which is the address-bar
+  reflex every browser has already trained. `hyprctl activewindow` still
+  reports the real client while a layer surface holds the keyboard (verified),
+  so the focused window is read at open() and the class decides whether
+  replacing is even possible. On a terminal it falls back to opening a window
+  and says so on the row -- inventing a behaviour for non-browsers was
+  explicitly out of scope, and a chord that silently does nothing is worse
+  than one that does the ordinary thing. Shift+Enter always opens a new
+  window even here: a tab cannot move between Chrome profiles.
+- **Navigating an existing window goes through the extension, and has to.**
+  Chrome has no command line for "point that window at this URL"; every
+  profile shares one browser process and one window class, so nothing outside
+  Chrome can even name the window. `navigateFocused()` writes
+  `~/.local/state/literate/chrome-command.json` (tmp+rename), every profile's
+  native host polls it and forwards the command to its extension, and the
+  extension acts only if one of ITS windows matches the focused window's
+  title -- so the command can be broadcast without any of the senders knowing
+  which profile owns the window. Commands carry an id and an `issuedAt`; a
+  host ignores the one present when it starts and anything older than 15s, or
+  a stale file would navigate something the next time Chrome launched. The
+  alternative (spawn a replacement window, close the old one) was rejected:
+  it flickers and loses the window's place in the tiling layout, which is the
+  one thing "in this window" is about.
 - It is **not** a manifest entry point. The obvious design — a new `"panel"`
   kind with `entryPoints.panel: "Triage.qml"` — doesn't work: shell.qml's
   `computePanelEntries()` builds exactly one panel/overlay/menu Loader **per
