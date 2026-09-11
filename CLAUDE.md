@@ -481,3 +481,43 @@ the `local` backend working; they are the answer when someone asks.
 The omnibox index goes further than any of the above: it reads all of
 Chrome's browsing history and every past Claude Code conversation's title,
 not just what's open right now. `omnibox_index: false` is the off switch.
+
+## Live window thumbnails work, and the join is the interesting part
+
+Quickshell ships `ScreencopyView` (`Quickshell.Wayland`, from
+`_Screencopy`). It captures a real window's pixels **including windows on a
+workspace that is not currently visible**, which is the whole premise of the
+shelf. Verified with a throwaway `quickshell -p` config against a window
+parked on workspace 2 while workspace 1 was showing: `hasContent` went true,
+`sourceSize` reported the window's real size in physical pixels
+(2968x1844 for a 1484x922 logical window at scale 2), and the grab was a
+legible Gmail screenshot. Nine of them render at once with no visible
+difference.
+
+The sticking point is the mapping, and Hyprland's own module solves it:
+
+- `captureSource` wants a `qs::wayland::toplevel::Toplevel` — the object in
+  `ToplevelManager.toplevels`. That type exposes only `appId`, `title`,
+  `activated` and friends. **None of those is a key**, so matching a
+  `hyprctl` address to a Toplevel by app-id and title is guesswork the moment
+  two windows share both.
+- `Quickshell.Hyprland`'s `Hyprland.toplevels` holds `HyprlandToplevel`
+  objects instead, and each one carries **`address` AND `wayland`** (the
+  Wayland `Toplevel`), plus `workspace` and a `lastIpcObject` that is the
+  whole `hyprctl -j clients` record (`at`, `size`, `class`, ...). So the join
+  already exists: address for the daemon's data, `.wayland` for the pixels,
+  `lastIpcObject` for the geometry. Never reconstruct it by title.
+- `HyprlandToplevel.address` has **no `0x` prefix**; `hyprctl` and the daemon
+  both write `0xaaaa...`. Everything goes through
+  `Omnibox.normalizeAddress()`, same rule as the daemon's own
+  `normalize_address()`.
+- `ToplevelManager.toplevels` is **empty at `Component.onCompleted`** — it
+  fills asynchronously. Anything that walks it has to do so later.
+
+Cost: nine `live: true` views cost the shell **~16% of a core** for as long as
+they are on screen. The shelf therefore sets `live: false` and pulls one frame
+per view off a 1.5 s timer that only runs while the surface is visible, which
+measures at **~1% over idle**. A thumbnail a second and a half stale is not
+one anybody can pick out; a fan spinning up while you glance at your
+workspaces is.
+
