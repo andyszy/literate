@@ -483,14 +483,18 @@ Item {
   // gmail.com. Pinned, it is always on screen, always one key from the
   // cursor's home, and Enter still belongs to the best result -- which is
   // exactly where Chrome puts its own default suggestion.
+  // Never null: an empty query still offers a browser window, because with
+  // SUPER+T repointed at this surface there is no longer any keybind that
+  // opens one. "No query" must not mean "no way out to the web".
   readonly property var queryAction: Omnibox.urlOrSearch(root.query, root.searchEngine)
+    || Omnibox.newWindowAction()
   // A query with no matches at all leaves the panel region pointing at
   // nothing, and Enter doing nothing is precisely the state this piece exists
   // to abolish. So an empty result list hands the region to the pinned row
   // rather than to the void. Everything that draws or dispatches reads this,
   // never focusRegion directly.
   readonly property string activeRegion: (root.focusRegion === "panel"
-    && root.selectableRows.length === 0 && root.queryAction) ? "action" : root.focusRegion
+    && root.selectableRows.length === 0) ? "action" : root.focusRegion
   readonly property var searchEngine: (root.omniboxIndex && root.omniboxIndex.search)
     ? root.omniboxIndex.search : null
 
@@ -562,19 +566,26 @@ Item {
   // interesting half of "open" is which one -- and it is stated rather than
   // implied, so Shift+Enter is never a guess.
   function enterHint() {
+    // The profiles are named whenever Enter opens a link, and named more
+    // quietly when it does not -- but always NAMED. Which account a keystroke
+    // uses is the one thing about this surface that must never have to be
+    // remembered, and the display names are the only spelling of a profile a
+    // person should ever have to read.
+    var primary = root.profileName(root.enterProfile)
+    var secondary = root.profileName(root.shiftProfile)
+    var suffix = (root.chromeProfiles.length > 2) ? " (⌃⇥ next)" : ""
     if (root.activeRegion === "shelf")
       return "⏎ " + (root.selectedWorkspace > 0
         ? "go to workspace " + root.selectedWorkspace : "type to search")
-    if (root.opensInBrowser() && root.enterProfile) {
-      var hint = "⏎ " + root.profileName(root.enterProfile)
-      if (root.shiftProfile) hint += " · ⇧⏎ " + root.profileName(root.shiftProfile)
-      if (root.chromeProfiles.length > 2) hint += " (⌃⇥ next)"
-      return hint
-    }
+    if (root.opensInBrowser() && primary)
+      return "⏎ " + primary + (secondary ? " · ⇧⏎ " + secondary : "") + suffix
     if (root.activeRegion === "action")
-      return "⏎ " + (root.queryAction && root.queryAction.kind === "open"
-        ? "open it" : "search the web")
+      return "⏎ " + (!root.queryAction ? "search the web"
+        : root.queryAction.kind === "open" ? "open it"
+        : root.queryAction.kind === "window" ? "new window" : "search the web")
     return "⏎ focus / resume / open"
+      + (primary ? ("    links ⏎ " + primary
+                    + (secondary ? " · ⇧⏎ " + secondary : "") + suffix) : "")
   }
 
   function cycleShiftProfile() {
@@ -816,13 +827,14 @@ Item {
   // the same row opens in either account depending only on which key was
   // pressed. Chrome's --profile-directory takes the DIRECTORY name, which is
   // why the index carries both that and the display name.
+  // An empty url means "just a window", which is the empty-query action.
   function openUrl(url, secondary) {
-    if (!url) return
     var profile = secondary ? root.shiftProfile : root.enterProfile
+    var target = url ? (" " + Util.shellQuote(url)) : " --new-window"
     var cmd = (profile && profile.dir)
       ? ("setsid uwsm-app -- google-chrome-stable --profile-directory="
-         + Util.shellQuote(profile.dir) + " " + Util.shellQuote(url))
-      : ("omarchy launch browser " + Util.shellQuote(url))
+         + Util.shellQuote(profile.dir) + target)
+      : ("omarchy launch browser" + target)
     launchProc.command = ["hyprctl", "dispatch", root.execCmdDispatch(cmd)]
     launchProc.running = true
   }
@@ -1186,6 +1198,9 @@ Item {
   // Entry point for the submap binds above, via Overlay.qml's shelfLaunch().
   function launchWithQuery(kind) {
     var q = String(root.query || "").replace(/^\s+|\s+$/g, "")
+    // The browser chord with nothing typed is the same standing offer the
+    // pinned row makes: a window, in the armed profile.
+    if (!q && kind === "browser") { root.openUrl(""); root.closeRequested(); return }
     if (!q) return
     if (kind === "terminal") root.launchTerminal(q)
     else if (kind === "browser") root.launchBrowser(q)
@@ -1861,8 +1876,9 @@ Item {
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             width: Style.space(16)
-            text: root.glyph(root.queryAction && root.queryAction.kind === "open"
-              ? "arrow-up-right" : "magnifying-glass")
+            text: root.glyph(!root.queryAction ? "magnifying-glass"
+              : root.queryAction.kind === "open" ? "arrow-up-right"
+              : root.queryAction.kind === "window" ? "browser" : "magnifying-glass")
             color: root.accent
             font.family: phosphor.font.family
             font.pixelSize: Style.font.body
