@@ -3,6 +3,7 @@ import Quickshell.Io
 import QtQuick
 import qs.Commons
 import qs.Ui
+import "Omnibox.js" as Omnibox
 
 // Full-desktop triage view: every window on every real workspace, grouped by
 // what the user is DOING (bin/literate-workspace-namer --triage makes one
@@ -195,93 +196,22 @@ Item {
 
   // ------------------------------------------------------------- omnibox
   //
-  // Rank helper shared by both index tiers: 0 = query starts the text, 1 =
-  // query starts a word inside it, 2 = anywhere else, -1 = no match at all.
-  // Deliberately simple -- plain substring at heart, no fuzzy subsequence
-  // scoring -- so ordering stays predictable.
-  function textRank(text, query) {
-    var t = String(text || "").toLowerCase()
-    var q = query
-    if (!q) return -1
-    var idx = t.indexOf(q)
-    if (idx < 0) return -1
-    if (idx === 0) return 0
-    return /[^a-z0-9]/i.test(t.charAt(idx - 1)) ? 1 : 2
-  }
+  // The matching, ranking and title-normalisation rules themselves live in
+  // Omnibox.js, shared verbatim with Shelf.qml -- two views over the same
+  // index must not rank the same query differently. These wrappers only
+  // supply this view's parsed index.
+
+  function textRank(text, query) { return Omnibox.textRank(text, query) }
 
   function matchConversations(query) {
-    var q = String(query || "").toLowerCase()
-    var convs = (root.omniboxIndex && Array.isArray(root.omniboxIndex.conversations))
-      ? root.omniboxIndex.conversations : []
-    var matched = []
-    for (var i = 0; i < convs.length; i++) {
-      var conv = convs[i]
-      if (!conv) continue
-      var rank = root.textRank(conv.title, q)
-      if (rank < 0) continue
-      matched.push({ item: conv, rank: rank })
-    }
-    matched.sort(function(a, b) {
-      if (a.rank !== b.rank) return a.rank - b.rank
-      return (Number(b.item.mtime) || 0) - (Number(a.item.mtime) || 0)
-    })
-    return matched.map(function(m) { return m.item })
+    return Omnibox.matchConversations(query, root.omniboxIndex)
   }
 
   function matchHistory(query) {
-    var q = String(query || "").toLowerCase()
-    var hist = (root.omniboxIndex && Array.isArray(root.omniboxIndex.history))
-      ? root.omniboxIndex.history : []
-    var matched = []
-    for (var i = 0; i < hist.length; i++) {
-      var h = hist[i]
-      if (!h) continue
-      var titleRank = root.textRank(h.title, q)
-      var domainRank = root.textRank(h.domain, q)
-      var rank = -1
-      if (titleRank >= 0 && domainRank >= 0) rank = Math.min(titleRank, domainRank)
-      else if (titleRank >= 0) rank = titleRank
-      else if (domainRank >= 0) rank = domainRank
-      if (rank < 0) continue
-      matched.push({ item: h, rank: rank })
-    }
-    matched.sort(function(a, b) {
-      if (a.rank !== b.rank) return a.rank - b.rank
-      var byVisit = (Number(b.item.lastVisit) || 0) - (Number(a.item.lastVisit) || 0)
-      if (byVisit !== 0) return byVisit
-      return (Number(b.item.visits) || 0) - (Number(a.item.visits) || 0)
-    })
-    return matched.map(function(m) { return m.item })
+    return Omnibox.matchHistory(query, root.omniboxIndex)
   }
 
-  // Mirrors bin/literate-workspace-namer's strip_status_glyphs(): drop
-  // leading whitespace and symbol/spinner characters so a live Claude Code
-  // window title (which carries a status glyph while the agent is working)
-  // compares equal to the index's already-clean ai-title. Re-implemented
-  // here rather than imported (bin/ is owned by another agent right now) as
-  // explicit code-point ranges for the Unicode symbol blocks CLI spinners
-  // draw from (arrows/math/misc-technical/geometric-shapes/dingbats/
-  // braille/misc-symbols, plus emoji), rather than the daemon's
-  // unicodedata-category test, since this QML engine's regex support for
-  // \p{..} Unicode property escapes is not something to depend on. This
-  // never touches real letters (Latin, CJK, ...), only the code-point
-  // ranges the spinner glyphs themselves live in.
-  function isStatusGlyphCodePoint(cp) {
-    return (cp >= 0x2190 && cp <= 0x2BFF) || (cp >= 0xFE00 && cp <= 0xFE0F)
-      || (cp >= 0x1F300 && cp <= 0x1FAFF)
-  }
-
-  function stripStatusGlyphs(title) {
-    var s = String(title || "")
-    var i = 0
-    while (i < s.length) {
-      var cp = s.codePointAt(i)
-      if (cp === 0x20 || cp === 0x09) { i += 1; continue }
-      if (root.isStatusGlyphCodePoint(cp)) { i += (cp > 0xFFFF ? 2 : 1); continue }
-      break
-    }
-    return s.slice(i)
-  }
+  function stripStatusGlyphs(title) { return Omnibox.stripStatusGlyphs(title) }
 
   // Claude Code sets an org.omarchy.claude terminal's window title to the
   // conversation's ai-title, so a live window whose (glyph-stripped) title
