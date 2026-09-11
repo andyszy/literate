@@ -7,6 +7,7 @@ an icon. Results land in a JSON file the bar widget watches.
 
   state:   ~/.local/state/literate/workspaces.json
   pinned:  ~/.local/state/literate/pinned.json
+  focus:   ~/.local/state/literate/focus.json
   cache:   ~/.local/state/literate/cache.json
   triage:  ~/.local/state/literate/triage.json
   omnibox: ~/.local/state/literate/omnibox-index.json
@@ -58,6 +59,15 @@ TRIAGE_PATH = STATE_DIR / "triage.json"
 # Kept apart from STATE_PATH because that file is rewritten wholesale every
 # pass -- a pin stored inside it would be gone the next time the model runs.
 PINNED_PATH = STATE_DIR / "pinned.json"
+# Hyprland keeps no per-window last-focus time, and nothing else on the
+# machine does either: a window open right now can have a six-day-old Chrome
+# history row behind it, so joining against history to answer "when did I last
+# touch this" lies. The daemon is already on the event socket, so it watches
+# activewindowv2 and writes what it sees here. {address: epoch seconds}.
+FOCUS_PATH = STATE_DIR / "focus.json"
+# Focus changes arrive as fast as someone can alt-tab. Batch them: the file is
+# only interesting to a UI that is about to open, never to the millisecond.
+FOCUS_FLUSH_INTERVAL = 5.0
 # Written by the literate-tabs Chrome extension's native-messaging host
 # (~/.config/omarchy/chrome-extensions/literate-tabs-host), not by this
 # daemon -- read-only from here.
@@ -221,6 +231,16 @@ def hyprctl(*args):
     if out.returncode != 0:
         raise RuntimeError(f"hyprctl {args}: {out.stderr.strip()}")
     return json.loads(out.stdout)
+
+
+def normalize_address(address):
+    """One spelling for a window address. hyprctl says "0xaaaaf6e5f8c0";
+    socket2's activewindowv2/closewindow payloads say "aaaaf6e5f8c0" with no
+    prefix, and the two have to key the same dict."""
+    address = (address or "").strip().lower()
+    if not address:
+        return ""
+    return address if address.startswith("0x") else "0x" + address
 
 
 def strip_status_glyphs(title):
@@ -1089,6 +1109,15 @@ class Namer:
         self.cache = load_json(CACHE_PATH, {})
         self.state = load_json(STATE_PATH, {})
         self.pinned = load_json(PINNED_PATH, {})
+        # {address: epoch seconds} of the last time each window took focus.
+        # Read here so a short-lived CLI run (--triage, --suggest) can report
+        # what the daemon has recorded; only the daemon ever writes it.
+        self.focus = {str(k): int(v) for k, v in (load_json(FOCUS_PATH, {}) or {}).items()
+                      if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        self.focus_lock = threading.Lock()
+        self.focus_timer = None
+        self.focus_dirty = False
+        self.live_addresses = set()
         self.lock = threading.Lock()
         self.pass_lock = threading.Lock()
         # Triage precompute runs outside pass_lock (naming must never wait on
@@ -1131,7 +1160,9 @@ class Namer:
         the two drifting apart."""
         ignore = {c.lower() for c in self.cfg["ignore_classes"]}
         raw = []
+        live = set()
         for c in hyprctl("clients"):
+            live.add(normalize_address(c.get("address")))
             ws = (c.get("workspace") or {}).get("id")
             if not isinstance(ws, int) or ws < 1:
                 continue  # special/scratchpad workspaces have negative ids
@@ -1140,6 +1171,9 @@ class Namer:
                 continue
             title = clean_title((c.get("title") or "").strip())[: self.cfg["max_title_chars"]]
             raw.append([ws, cls, title, c.get("address", "")])
+        # Every address Hyprland knows about, unfiltered -- prune_focus() needs
+        # the full set or it would forget a scratchpad window every pass.
+        self.live_addresses = live - {""}
 
         matches = self._chrome_matches(raw)
         mode = self.cfg.get("chrome_urls", "domain")
@@ -1192,12 +1226,17 @@ class Namer:
         return by_ws
 
     @staticmethod
-    def triage_windows(clients):
+    def triage_windows(clients, focus=None):
         """The flat, indexed window list --triage groups and the triage cache
         stores. Split out from triage() so a pass can build it from the client
-        list it already has, without a second hyprctl call."""
+        list it already has, without a second hyprctl call.
+
+        `lastFocus` is deliberately absent from triage_signature(): focusing a
+        window is not a change to the window *set*, and hashing it in would
+        throw away the precomputed grouping on every alt-tab."""
         return [{"index": i, "address": addr, "class": cls, "title": title,
-                 "workspace": str(ws), **identity}
+                 "workspace": str(ws), **identity,
+                 "lastFocus": focus.get(normalize_address(addr)) if focus else None}
                 for i, (ws, cls, title, addr, identity) in enumerate(clients)]
 
     def snapshot(self):
@@ -1207,7 +1246,8 @@ class Namer:
         """Every (filtered) window on one workspace, in hyprctl's own order,
         keeping the address -- snapshot() throws that away since naming only
         needs class+title, but --suggest hands addresses back to the caller."""
-        return [{"address": addr, "class": cls, "title": title, **identity}
+        return [{"address": addr, "class": cls, "title": title, **identity,
+                 "lastFocus": self.last_focus(addr)}
                 for ws, cls, title, addr, identity in self._filtered_clients() if ws == ws_id]
 
     @staticmethod
@@ -1222,6 +1262,92 @@ class Namer:
         the key the precomputed triage cache is stored and matched under."""
         key = sorted([w["address"], w["class"], w["title"], w["workspace"]] for w in windows)
         return hashlib.sha1(json.dumps(key).encode()).hexdigest()
+
+    # ------------------------------------------------------------------- focus
+
+    def last_focus(self, address):
+        """Epoch seconds, or None for a window this daemon has never watched
+        take focus. None is the honest answer and the UI has to render it as
+        such -- inventing "now", or the window's age, would put a confident
+        wrong number in the one column that exists to be trusted."""
+        return self.focus.get(normalize_address(address))
+
+    def note_focus(self, address, when=None):
+        """activewindowv2 fired. No hyprctl, no model, no disk: a dict write
+        and, at most once every FOCUS_FLUSH_INTERVAL, a timer. This runs on
+        every alt-tab, so it has to cost nothing."""
+        address = normalize_address(address)
+        if not address:
+            return  # activewindowv2 with an empty payload = focus left everything
+        with self.focus_lock:
+            self.focus[address] = int(time.time() if when is None else when)
+            self.focus_dirty = True
+            if self.focus_timer is None:
+                self.focus_timer = threading.Timer(FOCUS_FLUSH_INTERVAL, self.flush_focus)
+                self.focus_timer.daemon = True
+                self.focus_timer.start()
+
+    def flush_focus(self):
+        """Write the coalesced batch. Atomic like every other state file, so a
+        UI watching it never parses half a write."""
+        with self.focus_lock:
+            self.focus_timer = None
+            if not self.focus_dirty:
+                return
+            payload = dict(self.focus)
+            self.focus_dirty = False
+        try:
+            write_atomic(FOCUS_PATH, payload)
+        except OSError as e:
+            log("focus: write failed:", e)
+
+    def forget_focus(self, address):
+        """closewindow carries the address, so the cheapest possible prune is
+        right here: the window is gone, its timestamp is meaningless."""
+        address = normalize_address(address)
+        if not address:
+            return
+        with self.focus_lock:
+            gone = self.focus.pop(address, None) is not None
+            if gone:
+                self.focus_dirty = True
+        if gone:
+            self.flush_focus()
+
+    def prune_focus(self, live):
+        """The backstop for what forget_focus() missed -- windows that closed
+        while the daemon was down, mostly. `live` is every address Hyprland
+        reports, unfiltered, so ignore_classes and the scratchpad keep theirs.
+        Without this the file grows for the life of the machine."""
+        if not live:
+            return
+        with self.focus_lock:
+            gone = [a for a in self.focus if a not in live]
+            for a in gone:
+                del self.focus[a]
+            if gone:
+                self.focus_dirty = True
+        if gone:
+            self.flush_focus()
+
+    def seed_focus(self):
+        """Hyprland sends no activewindowv2 to a socket that has just
+        connected, so the window focused when the daemon starts would read as
+        never-focused until someone touched something else. Stamping it is an
+        observation, not a guess -- it *is* focused at this instant -- and it
+        only ever applies to an address we have no record of, so a restart can
+        never overwrite a real earlier timestamp with "now"."""
+        try:
+            address = normalize_address((hyprctl("activewindow") or {}).get("address"))
+        except Exception as e:
+            log("focus: seed skipped:", e)
+            return
+        if not address:
+            return
+        with self.focus_lock:
+            if address in self.focus:
+                return
+        self.note_focus(address)
 
     # ------------------------------------------------------------------- model
 
@@ -1367,13 +1493,16 @@ class Namer:
             # Cheap, and lets `--pin`/`--unpin` from another process take
             # effect without restarting the daemon.
             self.pinned = load_json(PINNED_PATH, {})
+            # _filtered_clients() has just seen every address Hyprland knows
+            # about, so the prune costs nothing extra here.
+            self.prune_focus(self.live_addresses)
             self.apply(self.group_by_workspace(clients), started)
         # Deliberately outside pass_lock: naming is the job, triage is
         # opportunistic, and a slow model call here must not hold up the next
         # naming pass. Only the daemon's own debounced fire() asks for it --
         # `--once` stays a single-call operation.
         if precompute:
-            self.maybe_precompute_triage(self.triage_windows(clients))
+            self.maybe_precompute_triage(self.triage_windows(clients, self.focus))
             self.maybe_refresh_omnibox_index()
 
     def apply(self, current, started):
@@ -1516,7 +1645,7 @@ class Namer:
         falls back to asking the model live, exactly as this always did.
         `cached` in the payload says which happened."""
         try:
-            windows = self.triage_windows(list(self._filtered_clients()))
+            windows = self.triage_windows(list(self._filtered_clients()), self.focus)
         except Exception as e:
             return {"error": f"hyprctl failed: {e}"[:200]}, 1
         if not windows:
@@ -1526,7 +1655,13 @@ class Namer:
         if use_cache:
             hit = self.read_triage_cache(signature)
             if hit is not None:
-                return {**hit, "cached": True}, 0
+                # The signature covers address/class/title/workspace, so a hit
+                # says the window *set* is unchanged -- it says nothing about
+                # focus, which has very likely moved since. Re-stamp from the
+                # live map rather than serve a timestamp from whenever the
+                # daemon happened to precompute.
+                return {**hit, "windows": self.restamp_focus(hit.get("windows") or []),
+                        "cached": True}, 0
 
         payload, code = self.compute_triage(windows)
         if code == 0 and use_cache:
@@ -1597,6 +1732,12 @@ class Namer:
             return None
         return {"categories": categories, "windows": windows,
                 "updatedAt": data.get("updatedAt")}
+
+    def restamp_focus(self, windows):
+        """Refresh lastFocus on a cached window list. Cheap dict lookups; the
+        rest of each record is exactly what was cached."""
+        return [{**w, "lastFocus": self.last_focus(w.get("address"))}
+                if isinstance(w, dict) else w for w in windows]
 
     @staticmethod
     def write_triage_cache(signature, payload):
@@ -1843,6 +1984,7 @@ class Namer:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(path)
         log("listening on", path)
+        self.seed_focus()  # nothing replays the focus we missed before now
         self.schedule()  # name what's already open
 
         buf = b""
@@ -1853,8 +1995,15 @@ class Namer:
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
-                event = line.decode("utf-8", "replace").split(">>", 1)[0]
+                event, _, payload = line.decode("utf-8", "replace").partition(">>")
+                # Deliberately not in `watched`: which window has focus is not
+                # a change to the window *set*, so it must never cost a naming
+                # pass or a model call. Record it and move on.
+                if event == "activewindowv2":
+                    self.note_focus(payload)
+                    continue
                 if event == "closewindow":
+                    self.forget_focus(payload)
                     self.fast_clear_empty_workspaces()
                 if event in watched:
                     self.schedule()
