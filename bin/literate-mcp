@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""Expose this desktop to an agent over MCP: read every workspace, window,
+Chrome tab, history row and past conversation, then rearrange them.
+
+  claude mcp add literate -- ~/.local/bin/literate-mcp
+
+Transport is stdio JSON-RPC 2.0, newline-delimited, hand-rolled: the `mcp`
+package is not installed here and this file has to stay stdlib-only for the
+same reason bin/literate-workspace-namer does -- it runs under whatever
+python3 the session happens to have, with no venv guaranteed.
+
+Nothing about the desktop is *defined* here. Every path, every sqlite reader,
+the Chrome profile registry, the tab merge, window_identity() and the omnibox
+index all live in bin/literate-workspace-namer, and this file imports that
+script and calls into it. A second definition of "where does focus.json live"
+would be wrong within a week.
+
+  stdout is the protocol. Everything diagnostic goes to stderr (the daemon's
+  log() already does), or the transport dies mid-frame with no explanation.
+"""
+
+import importlib.machinery
+import importlib.util
+import json
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SERVER_NAME = "literate"
+SERVER_VERSION = "1.0"
+# Advertise back whatever the client asked for when we can speak it, which is
+# what the spec calls for; otherwise name ours and let the client decide.
+PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+DEFAULT_PROTOCOL = "2025-06-18"
+
+# Only http/https/file can be opened as a Chrome app window or navigated to;
+# chrome://, extension and data: URLs either refuse or open as something
+# broken. This is also the lock on the one string here that reaches a command
+# line, so it is a whitelist rather than a blacklist.
+RE_URL = re.compile(r"^(https?|file)://[^\s]+$", re.I)
+URL_MAX = 4096
+RE_ADDRESS = re.compile(r"^0x[0-9a-f]{1,16}$")
+RE_WORKSPACE = re.compile(r"^[0-9]{1,4}$")
+
+
+# --------------------------------------------------------------- the daemon
+
+def load_daemon():
+    """bin/literate-workspace-namer as a module.
+
+    It has no .py extension (it is a command, not a library) so it cannot be
+    imported by name -- SourceFileLoader is how tools/test-chrome.py and
+    tools/test-omnibox.py already do this. Its `if __name__ == "__main__"`
+    guard means importing it starts no daemon and makes no model call.
+
+    Found next to this file first, so a copy of this script outside the plugin
+    still works; then on PATH, which is the symlink tools/install makes.
+    """
+    path = Path(__file__).resolve().parent / "literate-workspace-namer"
+    if not path.exists():
+        found = shutil.which("literate-workspace-namer")
+        if not found:
+            raise RuntimeError("cannot find literate-workspace-namer next to "
+                               "literate-mcp or on PATH")
+        path = Path(found).resolve()
+    loader = importlib.machinery.SourceFileLoader("literate_namer", str(path))
+    spec = importlib.util.spec_from_loader("literate_namer", loader)
+    module = importlib.util.module_from_spec(spec)
+    # Importing a source file normally caches bytecode in a __pycache__ beside
+    # it -- which here means WRITING INTO THE PLUGIN DIRECTORY, and any write
+    # there trips omarchy's hot reloader, which segfaults quickshell and takes
+    # the user's bar down with it. It only happens the first time after the
+    # daemon changes, which is exactly the occasion someone would blame on
+    # their edit rather than on this import.
+    saved = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = saved
+    return module
+
+
+D = load_daemon()
+
+# The daemon writes this; the literate-tabs native host polls it. Not a
+# constant in the daemon because the daemon never touches it -- Triage.qml and
+# Proto.qml write it from QML, and now so does this. If a fourth writer ever
+# appears, promote it into the daemon beside FOCUS_PATH.
+CHROME_COMMAND_PATH = D.STATE_DIR / "chrome-command.json"
+# Must not exceed COMMAND_MAX_AGE in literate-tabs-host (15 s): a host ignores
+# anything older, so a command we write has to be acted on promptly or not
+# at all. We only ever write `issuedAt = now`, so this is documentation.
+LITERATE_TABS_ID_PATH = (Path.home() / ".config/omarchy/chrome-extensions"
+                         / "literate-tabs.id")
+
+
+class ToolError(Exception):
+    """A tool failed in a way the agent should see and can act on."""
+
+
+def namer():
+    """A fresh Namer per call.
+
+    Namer.__init__ snapshots config, pinned.json, workspaces.json and
+    focus.json off disk, and this process outlives all four -- the daemon
+    rewrites focus.json every few seconds. Re-reading is ~100 KB of JSON and
+    a couple of milliseconds; serving a stale answer is a bug report.
+    """
+    return D.Namer()
+
+
+# ------------------------------------------------------------- compositor
+
+def dispatch(lua):
+    """One hyprctl dispatch, in the Lua TABLE form, checked properly.
+
+    Two traps in one call. Classic dispatch strings are Lua SYNTAX ERRORS on
+    this build -- `hyprctl dispatch closewindow address:0x..` fails outright,
+    and the positional string form of a dispatcher that does parse silently
+    acts on the FOCUSED window instead of the selector. So every caller here
+    passes `hl.dsp.<thing>({ ... })`.
+
+    And a failure comes back on STDOUT, often with a zero exit code:
+    "warning: hl.focus: window not found" reads exactly like success to
+    anything that only checks returncode. The literal "ok" is the only
+    success.
+    """
+    out = subprocess.run(["hyprctl", "dispatch", lua],
+                         capture_output=True, text=True, timeout=15)
+    text = (out.stdout + out.stderr).strip()
+    if out.returncode != 0 or text != "ok":
+        raise ToolError(f"hyprctl dispatch failed: {text or f'exit {out.returncode}'} "
+                        f"(dispatched: {lua})")
+    return text
+
+
+def lua_string(value):
+    """A Lua double-quoted string literal body."""
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def exec_cmd(shell_command, rules=None):
+    """Launch a process through the compositor, optionally with exec rules.
+
+    `hl.dsp.exec_cmd(cmd, rules?)` is the Lua signature (see
+    /usr/share/hypr/stubs/hl.meta.lua); `{ workspace = "3 silent" }` is how a
+    window lands somewhere other than the focused workspace without dragging
+    the user there.
+    """
+    lua = f'hl.dsp.exec_cmd("{lua_string(shell_command)}"'
+    if rules:
+        pairs = ", ".join(f'{k} = "{lua_string(v)}"' for k, v in rules.items())
+        lua += f", {{ {pairs} }}"
+    return dispatch(lua + ")")
+
+
+def check_address(address):
+    norm = D.normalize_address(address)
+    if not RE_ADDRESS.match(norm):
+        raise ToolError(f"not a window address: {address!r} "
+                        "(expected 0x… as list_workspaces reports it)")
+    return norm
+
+
+def check_workspace(ws):
+    ws = str(ws).strip()
+    if not RE_WORKSPACE.match(ws):
+        raise ToolError(f"not a workspace id: {ws!r} (expected a number)")
+    return ws
+
+
+def check_url(url):
+    url = str(url or "").strip()
+    if len(url) > URL_MAX or not RE_URL.match(url):
+        raise ToolError(f"not an openable url: {url[:120]!r} "
+                        "(http://, https:// or file:// only)")
+    return url
+
+
+def clients_by_address():
+    """{address: raw hyprctl clients record}.
+
+    `floating` and focus order are not in what _filtered_clients() yields, and
+    they are two of the things an agent most needs; this is the join for them,
+    not a second window list.
+
+    There is no `focused` field in a client record -- the datum is
+    `focusHistoryID`, where 0 is the focused window and higher numbers are how
+    far back it was last used, which is a more useful answer than a boolean
+    anyway. It agrees with `hyprctl activewindow` even while one of this
+    plugin's layer surfaces holds the keyboard.
+    """
+    return {D.normalize_address(c.get("address")): c for c in D.hyprctl("clients")}
+
+
+# ------------------------------------------------------------- chrome urls
+
+def url_mode(cfg):
+    """How much of a Chrome URL this server may report.
+
+    The daemon's `chrome_urls` is a privacy decision the user has already
+    made about what leaves the machine, and an MCP client is strictly more
+    exposure than a local model call, so it is honoured as the default rather
+    than widened. `mcp_urls`, when set, is an explicit override for this
+    server alone -- the point being that widening has to be a deliberate act,
+    not a side effect of a new tool existing.
+    """
+    explicit = cfg.get("mcp_urls")
+    if isinstance(explicit, str) and explicit.strip():
+        mode, source = explicit.strip(), "mcp_urls"
+    else:
+        mode, source = str(cfg.get("chrome_urls", "domain")), "chrome_urls"
+    if mode not in ("domain", "full", "off"):
+        mode, source = "domain", f"{source} invalid, defaulted"
+    return mode, source
+
+
+def shown_url(url, mode):
+    if mode == "off":
+        return None
+    if mode == "domain":
+        return D.registrable_domain(url) or None
+    return url or None
+
+
+def literate_tabs_instances():
+    """{instanceId: profile directory} for the literate-tabs extension.
+
+    Chrome tells a native host nothing about the profile that launched it, and
+    getProfileUserInfo() returns an empty email for a profile that has not
+    consented to sync (which is both profiles here), so the extension's
+    reported `email` is usually absent. The instance id is not: the extension
+    mints it in chrome.storage.local, which physically lives under
+    <user-data-dir>/<profile>/Local Extension Settings/<extension-id>/. So
+    whichever profile's LevelDB contains the id is the profile that reported.
+    Same technique as tile-tabs-host's resolve_profile(), against a different
+    extension id.
+    """
+    try:
+        ext_id = LITERATE_TABS_ID_PATH.read_text().strip()
+    except OSError:
+        return {}
+    if not re.match(r"^[a-p]{32}$", ext_id):
+        return {}
+    found = {}
+    for directory, _name in D.chrome_profile_dirs():
+        store = D.CHROME_DIR / directory / "Local Extension Settings" / ext_id
+        if not store.is_dir():
+            continue
+        blob = b""
+        try:
+            for path in sorted(store.iterdir()):
+                if path.name in ("LOCK", "LOG", "LOG.old", "CURRENT"):
+                    continue
+                blob += path.read_bytes()
+        except OSError:
+            continue
+        for instance in set(re.findall(rb"[0-9a-f]{16}", blob)):
+            found.setdefault(instance.decode(), directory)
+    return found
+
+
+# ------------------------------------------------------------------- search
+
+def matches(query, *fields):
+    """Every whitespace-separated term present, case-insensitively, somewhere
+    in the joined fields. Deliberately not the omnibox's ranking: an agent
+    asking "find the invoice page" wants recall, and Omnibox.js exists to pick
+    ONE answer for a keystroke."""
+    haystack = " ".join(str(f or "") for f in fields).lower()
+    terms = str(query or "").lower().split()
+    return all(term in haystack for term in terms)
+
+
+def omnibox_index():
+    index = D.load_json(D.OMNIBOX_INDEX_PATH, None)
+    if not isinstance(index, dict):
+        raise ToolError(
+            "no omnibox index at "
+            f"{D.OMNIBOX_INDEX_PATH}. The daemon rebuilds it after a settled "
+            "pass; `literate-workspace-namer --index-omnibox` builds it now. "
+            "It is also off entirely when config omnibox_index is false.")
+    return index
+
+
+# -------------------------------------------------------------------- tools
+
+TOOLS = []
+
+
+def tool(name, description, schema, live=None):
+    """Register a tool. `live` is an optional callable whose return value is
+    appended to the description at tools/list time -- a setting an agent has to
+    know the CURRENT value of (how much of a URL it is allowed to see) cannot be
+    baked in at import, and burying it only in the result means the agent finds
+    out after it has already asked."""
+    def wrap(fn):
+        TOOLS.append({"name": name, "description": description,
+                      "inputSchema": schema, "_fn": fn, "_live": live})
+        return fn
+    return wrap
+
+
+def obj(properties, required=()):
+    return {"type": "object", "properties": properties,
+            "required": list(required), "additionalProperties": False}
+
+
+# ------------------------------------------------------------- read tools
+
+@tool("list_workspaces",
+      "Every Hyprland workspace and the windows on it: id, the name and icon "
+      "the Literate daemon gave it, whether that name is pinned, its monitor, "
+      "and each window's address, class, resolved app name, title, floating, "
+      "focused (plus focusHistoryID: 0 is the focused window, 1 the one used "
+      "before it, and so on) and lastFocusedAt (epoch seconds, from the "
+      "daemon's focus.json; "
+      "null means this window has not taken focus since the daemon started -- "
+      "not that it is old). Workspaces with no windows are included when the "
+      "user has named or pinned one, because an empty named workspace is a "
+      "plan. Window addresses from here are what every write tool takes.",
+      obj({}))
+def list_workspaces(_args):
+    n = namer()
+    clients = list(n._filtered_clients())
+    raw = clients_by_address()
+    focused_address = next((a for a, c in raw.items()
+                            if c.get("focusHistoryID") == 0), "")
+
+    by_ws = {}
+    for ws, cls, title, addr, identity in clients:
+        norm = D.normalize_address(addr)
+        record = raw.get(norm) or {}
+        by_ws.setdefault(str(ws), []).append({
+            "address": norm,
+            "class": cls,
+            "title": title,
+            "floating": bool(record.get("floating")),
+            "focused": record.get("focusHistoryID") == 0,
+            "focusHistoryID": record.get("focusHistoryID"),
+            "lastFocusedAt": n.last_focus(norm),
+            **identity,
+        })
+
+    live = {}
+    for w in D.hyprctl("workspaces"):
+        if isinstance(w.get("id"), int) and w["id"] >= 1:
+            live[str(w["id"])] = w
+    monitors = {}
+    for m in D.hyprctl("monitors"):
+        active = (m.get("activeWorkspace") or {}).get("id")
+        if active is not None:
+            monitors[str(active)] = m.get("name") or ""
+
+    # An empty workspace the user has pinned or that still carries a name is a
+    # real answer to "what is this desktop for"; dropping it would hide the
+    # one part of the layout that was chosen rather than accumulated.
+    ids = set(by_ws) | set(live) | set(n.state) | set(n.pinned)
+    out = []
+    for ws in sorted(ids, key=lambda s: (not s.isdigit(), int(s) if s.isdigit() else 0, s)):
+        entry = n.pinned.get(ws) or n.state.get(ws) or {}
+        out.append({
+            "id": ws,
+            "name": entry.get("name", ""),
+            "icon": entry.get("icon", ""),
+            "pinned": ws in n.pinned,
+            "exists": ws in live,
+            "monitor": (live.get(ws) or {}).get("monitor") or monitors.get(ws, ""),
+            "focused": ws in monitors,
+            "windows": by_ws.get(ws, []),
+        })
+    return {"workspaces": out, "focusedWindow": focused_address or None,
+            "focusedWorkspaces": sorted(monitors)}
+
+
+@tool("list_chrome_tabs",
+      "Chrome's open windows and their tabs, per profile, as the literate-tabs "
+      "extension last reported them (a report older than 5 minutes is dropped "
+      "rather than trusted, so an empty answer can mean the extension is not "
+      "running). Grouped by the profile that reported, resolved from the "
+      "extension's per-profile storage on disk. HOW MUCH OF EACH URL IS "
+      "RETURNED FOLLOWS THE USER'S OWN SETTING: see `urlMode` in the result -- "
+      "\"domain\" gives the host only, \"full\" the whole URL, \"off\" no URL "
+      "at all. The daemon's `chrome_urls` decides that; config `mcp_urls` "
+      "overrides it for this server only.",
+      obj({}),
+      live=lambda: "The mode in force right now is \"%s\" (from %s)." % url_mode(namer().cfg))
+def list_chrome_tabs(_args):
+    n = namer()
+    mode, source = url_mode(n.cfg)
+    windows = D.load_chrome_tabs() or []
+    instances = literate_tabs_instances()
+    meta = D.chrome_profile_meta()
+
+    groups = {}
+    for w in windows:
+        instance = w.get("instance") or ""
+        directory = instances.get(instance) or ""
+        # The extension also sends the signed-in email from 1.2, when Chrome
+        # will give it one; match it the way window_profile() does.
+        if not directory and w.get("email"):
+            email = str(w["email"]).lower()
+            directory = next((d for d, m in meta.items() if m.get("email") == email), "")
+        key = directory or (f"instance:{instance}" if instance else "unknown")
+        group = groups.setdefault(key, {
+            "profile": directory or None,
+            "profileName": (meta.get(directory) or {}).get("name") or None,
+            "instance": instance or None,
+            "windows": [],
+        })
+        tabs = [t for t in (w.get("tabs") or []) if isinstance(t, dict)]
+        group["windows"].append({
+            "id": w.get("id"),
+            "activeTitle": w.get("activeTitle") or "",
+            "reportedAt": w.get("updatedAt"),
+            "tabs": [{"title": t.get("title") or "",
+                      "url": shown_url(t.get("url") or "", mode),
+                      "active": bool(t.get("active"))} for t in tabs],
+        })
+    return {"urlMode": mode, "urlModeFrom": source,
+            "profiles": list(groups.values())}
+
+
+@tool("get_triage",
+      "The daemon's precomputed grouping of every window on the desktop by "
+      "what the user is DOING (not by which app is open), straight from "
+      "triage.json -- a file read, never a model call. `ageSeconds` says how "
+      "stale it is and `stale` whether the window set has changed since it was "
+      "computed; when it has, list_workspaces is the ground truth and this is "
+      "a hint. Categories carry indices into the `windows` array.",
+      obj({}))
+def get_triage(_args):
+    payload = D.load_json(D.TRIAGE_PATH, None)
+    if not isinstance(payload, dict):
+        return {"categories": [], "windows": [], "present": False,
+                "note": f"no {D.TRIAGE_PATH}; the daemon writes it after a "
+                        "settled pass, or `literate-workspace-namer --triage` "
+                        "computes one now (that one does call the model)."}
+    n = namer()
+    try:
+        live = n.triage_signature(n.triage_windows(list(n._filtered_clients()), n.focus))
+    except Exception:
+        live = None
+    updated = payload.get("updatedAt")
+    return {
+        "present": True,
+        "categories": payload.get("categories") or [],
+        "windows": n.restamp_focus(payload.get("windows") or []),
+        "updatedAt": updated,
+        "ageSeconds": (int(time.time()) - int(updated)) if isinstance(updated, int) else None,
+        "stale": (live is not None and payload.get("signature") != live),
+    }
+
+
+@tool("search_history",
+      "Search Chrome's browsing history from the daemon's omnibox index (both "
+      "profiles, one row per URL). A row carries `profile`/`profileName` and "
+      "`typedCount` -- the number of times the user reached it by TYPING, "
+      "which is the column that separates a destination from a page they "
+      "happened to land on, and the one to rank by. Matching is all-terms "
+      "over title and URL. `indexAgeSeconds` says how fresh the index is.",
+      obj({"query": {"type": "string", "description": "space-separated terms; "
+                     "all must appear in the title or URL"},
+           "limit": {"type": "integer", "minimum": 1, "maximum": 200,
+                     "default": 20}},
+          ["query"]))
+def search_history(args):
+    index = omnibox_index()
+    limit = int(args.get("limit") or 20)
+    query = args.get("query") or ""
+    hits = [r for r in index.get("history") or []
+            if matches(query, r.get("title"), r.get("url"))]
+    hits.sort(key=lambda r: (-(r.get("typedCount") or 0), -(r.get("visits") or 0),
+                             -(r.get("lastVisit") or 0)))
+    rows = [{"title": r.get("title") or "", "url": r.get("url") or "",
+             "domain": r.get("domain") or "",
+             "profile": r.get("profile") or "", "profileName": r.get("profileName") or "",
+             "profiles": r.get("profiles") or [],
+             "typedCount": r.get("typedCount") or 0,
+             "visits": r.get("visits") or 0,
+             "lastVisit": r.get("lastVisit")}
+            for r in hits[:limit]]
+    return {"query": query, "matched": len(hits), "results": rows,
+            "indexAgeSeconds": index_age(index)}
+
+
+@tool("search_conversations",
+      "Search past Claude Code conversations by their own title, from the "
+      "daemon's omnibox index. Returns each one's session `id` and `project` "
+      "directory, which is exactly what resuming needs: run "
+      "`claude --resume <id>` in `project`. A transcript with no title record "
+      "is not in the index rather than given an invented name.",
+      obj({"query": {"type": "string", "description": "space-separated terms; "
+                     "all must appear in the title or project path"},
+           "limit": {"type": "integer", "minimum": 1, "maximum": 200,
+                     "default": 20}},
+          ["query"]))
+def search_conversations(args):
+    index = omnibox_index()
+    limit = int(args.get("limit") or 20)
+    query = args.get("query") or ""
+    hits = [c for c in index.get("conversations") or []
+            if matches(query, c.get("title"), c.get("project"))]
+    hits.sort(key=lambda c: -(c.get("mtime") or 0))
+    rows = [{"id": c.get("id") or "", "title": c.get("title") or "",
+             "project": c.get("project") or "", "messages": c.get("messages") or 0,
+             "mtime": c.get("mtime"),
+             "resume": f"claude --resume {c.get('id')}"} for c in hits[:limit]]
+    return {"query": query, "matched": len(hits), "results": rows,
+            "indexAgeSeconds": index_age(index)}
+
+
+@tool("list_chrome_profiles",
+      "Every Chrome profile signed in on this machine: its `dir` (the "
+      "internal directory name, and the only thing --profile-directory and "
+      "open_url accept), its display name, the signed-in email where Chrome "
+      "exposes one, its chip colours, and which one is primary. `Default` is "
+      "the first profile, never the only one.",
+      obj({}))
+def list_chrome_profiles(_args):
+    n = namer()
+    ordered = D.omnibox_profiles(n.cfg.get("chrome_profiles"),
+                                 n.cfg.get("omnibox_primary_profile"))
+    meta = D.chrome_profile_meta()
+    return {"profiles": [{**p, **{k: v for k, v in (meta.get(p["dir"]) or {}).items()
+                                  if k != "name"}} for p in ordered]}
+
+
+def index_age(index):
+    updated = index.get("updatedAt")
+    return (int(time.time()) - int(updated)) if isinstance(updated, int) else None
+
+
+# ------------------------------------------------------------ write tools
+
+@tool("move_window",
+      "Move one window to a workspace. `follow` true takes the user there "
+      "with it; false leaves them where they are, which is what reorganising "
+      "a desktop around somebody wants.",
+      obj({"address": {"type": "string", "description": "window address, 0x… "
+                       "as list_workspaces reports it"},
+           "workspace": {"type": "string", "description": "target workspace id"},
+           "follow": {"type": "boolean", "default": False}},
+          ["address", "workspace"]))
+def move_window(args):
+    address = check_address(args.get("address"))
+    ws = check_workspace(args.get("workspace"))
+    follow = "true" if args.get("follow") else "false"
+    dispatch(f'hl.dsp.window.move({{ workspace = "{ws}", follow = {follow}, '
+             f'window = "address:{address}" }})')
+    return {"moved": address, "workspace": ws, "followed": bool(args.get("follow"))}
+
+
+@tool("focus_window",
+      "Give one window keyboard focus. This moves the user's view to whatever "
+      "workspace the window is on.",
+      obj({"address": {"type": "string"}}, ["address"]))
+def focus_window(args):
+    address = check_address(args.get("address"))
+    dispatch(f'hl.dsp.focus({{ window = "address:{address}" }})')
+    return {"focused": address}
+
+
+@tool("focus_workspace",
+      "Switch the user to a workspace.",
+      obj({"id": {"type": "string", "description": "workspace id"}}, ["id"]))
+def focus_workspace(args):
+    ws = check_workspace(args.get("id"))
+    dispatch(f'hl.dsp.focus({{ workspace = "{ws}" }})')
+    return {"focusedWorkspace": ws}
+
+
+@tool("rename_workspace",
+      "Name a workspace and give it a Phosphor icon, and PIN that name so the "
+      "model stops renaming it on the next pass. This goes through the "
+      "daemon's own pin mechanism, so the name survives and appears on the bar "
+      "immediately; a workspace that does not exist yet can be named ahead of "
+      "opening anything in it. `icon` must be a Phosphor icon name (e.g. "
+      "\"envelope\", \"code\", \"airplane-tilt\"); omit it to keep the "
+      "current one. Use unpin_workspace to hand the name back to the model.",
+      obj({"id": {"type": "string"}, "name": {"type": "string"},
+           "icon": {"type": "string", "description": "Phosphor icon name, optional"}},
+          ["id", "name"]))
+def rename_workspace(args):
+    ws = check_workspace(args.get("id"))
+    name = str(args.get("name") or "").strip()
+    if not name:
+        raise ToolError("name is required")
+    icon = args.get("icon")
+    result, code = namer().pin(ws, name, str(icon) if icon else None)
+    if code != 0:
+        raise ToolError(str(result.get("error") or result))
+    return {"workspace": ws, "pinned": result}
+
+
+@tool("unpin_workspace",
+      "Drop a workspace's pinned name so the daemon's model names it again "
+      "from what is open on it.",
+      obj({"id": {"type": "string"}}, ["id"]))
+def unpin_workspace(args):
+    ws = check_workspace(args.get("id"))
+    result, code = namer().unpin(ws)
+    if code != 0:
+        raise ToolError(str(result.get("error") or result))
+    return {"workspace": ws, "unpinned": True}
+
+
+@tool("open_url",
+      "Open a URL in a NEW Chrome window, in a named profile, optionally on a "
+      "workspace other than the one the user is looking at. Always launches a "
+      "fresh `--app=` window: handing a bare URL to the running Chrome makes "
+      "it open a tab in some existing window AND ACTIVATE that window, which "
+      "on Hyprland drags the user to that window's workspace (measured: the "
+      "focused workspace flipped within a second). `--app=` stays put. To put "
+      "a URL in an EXISTING window instead, use navigate_window.",
+      obj({"url": {"type": "string", "description": "http://, https:// or file://"},
+           "profile": {"type": "string", "description": "Chrome profile "
+                       "directory or display name, from list_chrome_profiles; "
+                       "omit for the primary"},
+           "workspace": {"type": "string", "description": "workspace id to "
+                         "open it on; omit for the current one"}},
+          ["url"]))
+def open_url(args):
+    url = check_url(args.get("url"))
+    n = namer()
+    known = D.omnibox_profiles(n.cfg.get("chrome_profiles"),
+                               n.cfg.get("omnibox_primary_profile"))
+    wanted = str(args.get("profile") or "").strip().lower()
+    if wanted:
+        picked = next((p for p in known
+                       if wanted in (p["dir"].lower(), p["name"].lower())), None)
+        if picked is None:
+            raise ToolError(f"unknown Chrome profile {args['profile']!r}; known: "
+                            + ", ".join(f'{p["dir"]} ({p["name"]})' for p in known))
+    else:
+        picked = known[0] if known else None
+    command = "setsid uwsm-app -- google-chrome-stable"
+    if picked:
+        command += " --profile-directory=" + shlex.quote(picked["dir"])
+    command += " --app=" + shlex.quote(url)
+    rules = None
+    if args.get("workspace"):
+        # "silent" is the whole point: the window lands there and the user is
+        # not taken along.
+        rules = {"workspace": check_workspace(args["workspace"]) + " silent"}
+    exec_cmd(command, rules)
+    return {"opened": url, "profile": (picked or {}).get("dir"),
+            "workspace": args.get("workspace") or "current", "command": command}
+
+
+@tool("navigate_window",
+      "Point an already-open Chrome window at a URL, keeping the window where "
+      "it is in the tiling layout and keeping the tab's back history. Chrome "
+      "has no command line for this and every profile shares one process and "
+      "one window class, so the request goes through the literate-tabs "
+      "extension: a command file is written, every profile's native host "
+      "forwards it, and only the profile holding a window with that TITLE "
+      "acts. So it is fire-and-forget -- it returns as soon as the command is "
+      "written, and does nothing at all if the extension is not running or no "
+      "window matches. Pass a window address (the title is looked up) or the "
+      "title itself. WARNING, MEASURED: the extension calls "
+      "chrome.windows.update(focused: true) after navigating, so this ACTIVATES "
+      "the window and Hyprland follows -- the user is taken to that window's "
+      "workspace. That is right for the omnibox chord this path was built for "
+      "and wrong for rearranging somebody's desktop behind their back, so "
+      "follow it with focus_workspace to put them back, or use open_url on the "
+      "target workspace instead.",
+      obj({"address_or_title": {"type": "string", "description": "0x… window "
+                                "address, or the window's exact title"},
+           "url": {"type": "string"}},
+          ["address_or_title", "url"]))
+def navigate_window(args):
+    url = check_url(args.get("url"))
+    given = str(args.get("address_or_title") or "").strip()
+    if not given:
+        raise ToolError("address_or_title is required")
+    title, address = given, None
+    if RE_ADDRESS.match(D.normalize_address(given)):
+        address = D.normalize_address(given)
+        record = clients_by_address().get(address)
+        if record is None:
+            raise ToolError(f"no window at {address}")
+        # The extension compares against Chrome's own tab title, which is the
+        # window title with any browser-name suffix removed -- exactly what
+        # clean_title() leaves. Send the live title, not a cleaned-up one:
+        # titlesMatch() already tolerates the suffix.
+        title = record.get("title") or ""
+        if not title:
+            raise ToolError(f"window {address} has no title to match on")
+    now = time.time()
+    D.write_atomic(CHROME_COMMAND_PATH, {
+        "id": int(now * 1000), "issuedAt": now,
+        "action": "navigate", "url": url, "title": title})
+    return {"requested": url, "title": title, "address": address,
+            "note": "command written; the extension acts only if one of its "
+                    "windows has this title, and hosts ignore it after 15s. It "
+                    "also focuses that window, which moves the user to its "
+                    "workspace -- use focus_workspace to put them back."}
+
+
+@tool("close_window",
+      "Close one window. THIS IS THE USER'S LIVE DESKTOP and closing the "
+      "wrong window can destroy unsaved work or kill the terminal an agent is "
+      "running in, so this refuses to act unless `confirm` is true. Read "
+      "list_workspaces, be certain which address you mean, and never close a "
+      "window you did not open on a hunch.",
+      obj({"address": {"type": "string"},
+           "confirm": {"type": "boolean", "description": "must be true; the "
+                       "call is refused otherwise"}},
+          ["address", "confirm"]))
+def close_window(args):
+    address = check_address(args.get("address"))
+    if args.get("confirm") is not True:
+        raise ToolError("refused: close_window needs confirm=true. This is a "
+                        f"live desktop -- check what {address} actually is with "
+                        "list_workspaces first.")
+    record = clients_by_address().get(address)
+    if record is None:
+        raise ToolError(f"no window at {address}")
+    dispatch(f'hl.dsp.window.close({{ window = "address:{address}" }})')
+    return {"closed": address, "class": record.get("class") or "",
+            "title": record.get("title") or ""}
+
+
+# ----------------------------------------------------------------- protocol
+
+def tools_list():
+    out = []
+    for t in TOOLS:
+        entry = {k: v for k, v in t.items() if not k.startswith("_")}
+        if t.get("_live"):
+            try:
+                entry["description"] += " " + t["_live"]()
+            except Exception as e:  # a listing must never fail over a note
+                D.log("live tool description failed:", repr(e))
+        out.append(entry)
+    return out
+
+
+def call_tool(name, arguments):
+    entry = next((t for t in TOOLS if t["name"] == name), None)
+    if entry is None:
+        raise ToolError(f"no such tool: {name}")
+    payload = entry["_fn"](arguments if isinstance(arguments, dict) else {})
+    return {"content": [{"type": "text",
+                         "text": json.dumps(payload, indent=2, ensure_ascii=False)}]}
+
+
+def handle(request):
+    """One request -> a result dict, or None for a notification.
+
+    Raises RpcError for a protocol-level failure. A TOOL failure is not one of
+    those: it comes back as a normal result with isError set, which is what
+    lets the agent read the message and try something else instead of the
+    client tearing the connection down.
+    """
+    method = request.get("method")
+    params = request.get("params") or {}
+    if method == "initialize":
+        asked = params.get("protocolVersion")
+        version = asked if asked in PROTOCOL_VERSIONS else DEFAULT_PROTOCOL
+        return {"protocolVersion": version,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": (
+                    "Read the desktop with list_workspaces before changing it. "
+                    "Window addresses come from there. move_window with "
+                    "follow=false rearranges without yanking the user's view "
+                    "around; close_window needs confirm=true.")}
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return None
+    if method == "ping":
+        return {}
+    if method == "tools/list":
+        return {"tools": tools_list()}
+    if method == "tools/call":
+        name = params.get("name")
+        try:
+            return call_tool(name, params.get("arguments"))
+        except ToolError as e:
+            return {"content": [{"type": "text", "text": str(e)}], "isError": True}
+        except Exception as e:  # a bug here must not kill the session
+            D.log(f"tool {name} failed:", repr(e))
+            return {"content": [{"type": "text",
+                                 "text": f"{type(e).__name__}: {e}"}], "isError": True}
+    if isinstance(method, str) and method.startswith("notifications/"):
+        return None
+    raise RpcError(-32601, f"method not found: {method}")
+
+
+class RpcError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
+def reply(payload):
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def serve(stream=None):
+    stream = stream or sys.stdin
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except ValueError as e:
+            reply({"jsonrpc": "2.0", "id": None,
+                   "error": {"code": -32700, "message": f"parse error: {e}"}})
+            continue
+        if not isinstance(request, dict):
+            reply({"jsonrpc": "2.0", "id": None,
+                   "error": {"code": -32600, "message": "not a request object"}})
+            continue
+        rid = request.get("id")
+        try:
+            result = handle(request)
+        except RpcError as e:
+            if rid is not None:
+                reply({"jsonrpc": "2.0", "id": rid,
+                       "error": {"code": e.code, "message": e.message}})
+            continue
+        except Exception as e:
+            D.log("mcp handler failed:", repr(e))
+            if rid is not None:
+                reply({"jsonrpc": "2.0", "id": rid,
+                       "error": {"code": -32603, "message": f"{type(e).__name__}: {e}"}})
+            continue
+        # A notification has no id and gets no reply, ever -- answering one is
+        # a protocol violation some clients disconnect over.
+        if rid is None:
+            continue
+        reply({"jsonrpc": "2.0", "id": rid, "result": result if result is not None else {}})
+
+
+if __name__ == "__main__":
+    if "--tools" in sys.argv:  # a peek at the surface without a client
+        print(json.dumps(tools_list(), indent=2))
+        sys.exit(0)
+    serve()

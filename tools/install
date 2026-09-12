@@ -8,6 +8,7 @@ set -euo pipefail
 PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$HOME/.local/share/literate/venv"
 BIN="$HOME/.local/bin/literate-workspace-namer"
+MCP="$HOME/.local/bin/literate-mcp"
 
 if [[ ! -x $VENV/bin/python ]]; then
   echo "Creating venv with the Anthropic SDK at $VENV"
@@ -18,6 +19,8 @@ fi
 mkdir -p "$HOME/.local/bin" "$HOME/.config/literate"
 ln -sfn "$PLUGIN/bin/literate-workspace-namer" "$BIN"
 echo "Linked $BIN"
+ln -sfn "$PLUGIN/bin/literate-mcp" "$MCP"
+echo "Linked $MCP"
 
 cat <<SNIPPETS
 
@@ -33,4 +36,10 @@ Add to ~/.config/hypr/autostart.lua:
 Then: hyprctl reload, and start it once by hand:
 
   hyprctl dispatch 'hl.dsp.exec_cmd("uwsm-app -- literate-workspace-namer")'
+
+To let an agent read and rearrange this desktop, register the MCP server:
+
+  claude mcp add literate -- $MCP
+  claude mcp list
+
 SNIPPETS

@@ -948,3 +948,111 @@ yields no affordance.
   reply (`printf '\e[5n'` → the terminal answers `\e[0n` → readline expands
   the macro bound to it). A query that is an existing directory opens the
   terminal *there* instead.
+
+## The MCP server
+
+`bin/literate-mcp` is the whole desktop as MCP tools, so an agent can read it
+(workspaces, windows, Chrome tabs, the triage grouping, history,
+conversations) and rearrange it (move/focus/close, rename a workspace, open or
+navigate a URL). Linked to `~/.local/bin/literate-mcp` by `tools/install`,
+registered with `claude mcp add literate -- ~/.local/bin/literate-mcp`.
+`bin/` and `tools/` are already in `tools/sync-upstream`'s `--exclude` list, so
+unlike a new root-level QML file this one needs nothing added there.
+
+- **It is hand-rolled stdio JSON-RPC and must stay stdlib-only.** The `mcp`
+  package is not installed and is not going to be: the server runs under
+  whatever `python3` the session has, with no venv guaranteed, exactly like the
+  daemon. `initialize` / `notifications/initialized` / `tools/list` /
+  `tools/call` / `ping`, newline-delimited frames, protocol version echoed back
+  when it is one we know and `2025-06-18` otherwise.
+- **stdout is the transport.** Anything printed there that is not a frame kills
+  the session with no diagnostic. The daemon's `log()` writes to stderr and
+  `daemon.log`, which is why it is safe to call from here.
+- **A tool failure is a result, not an RPC error.** `isError: true` with the
+  message as text lets the agent read it and try something else; a JSON-RPC
+  error makes some clients tear the connection down. Protocol-level failures
+  (unknown method, bad JSON) are the only things that get an `error` object.
+- **It defines nothing about the desktop.** Every path, the sqlite
+  `immutable=1` readers, `chrome_profile_dirs()`/`chrome_profile_meta()`,
+  `load_chrome_tabs()`, `window_identity()`, `normalize_address()`,
+  `write_atomic()` and the omnibox index all come from importing
+  `bin/literate-workspace-namer` through `SourceFileLoader` -- the same trick
+  `tools/test-chrome.py` and `tools/test-omnibox.py` use, and the reason the
+  daemon's `if __name__ == "__main__"` guard has to stay intact. The single
+  exception is `CHROME_COMMAND_PATH`, which the daemon genuinely does not know
+  about (only `Triage.qml`, `Proto.qml` and the native host do); if a fourth
+  writer appears, promote it into the daemon.
+- **The import must not write bytecode.** `SourceFileLoader.exec_module()`
+  caches a `.pyc` in `bin/__pycache__/` beside the daemon, which is a write
+  into the plugin directory, which trips omarchy's hot reloader and segfaults
+  quickshell. It only fires the first run after the daemon source changes -- so
+  the crash would land on whoever edited the daemon, not on whoever wrote this
+  import. `sys.dont_write_bytecode` is set around the one call.
+- **A fresh `Namer()` per tool call.** `Namer.__init__` snapshots config,
+  `pinned.json`, `workspaces.json` and `focus.json` off disk, and this process
+  outlives all four -- the daemon rewrites `focus.json` every few seconds. One
+  long-lived Namer serves stale focus data forever.
+- **`hl.dsp.*` in the TABLE form, and check for the literal `"ok"`.** Classic
+  dispatch strings are Lua syntax errors on this build, and the positional
+  string form of a dispatcher that does parse acts on the FOCUSED window
+  instead of the selector. Worse, failures come back on **stdout** with a zero
+  exit code: `warning: hl.focus: window not found` reads exactly like success
+  to anything that only checks `returncode`. `dispatch()` treats anything but
+  `"ok"` as a failure, which is the only test that catches both.
+- **`hl.dsp.exec_cmd(cmd, rules)` is how a window lands on another workspace
+  without taking the user there.** The second argument is a rules table
+  (`/usr/share/hypr/stubs/hl.meta.lua`), and `{ workspace = "9 silent" }`
+  works: measured, the Chrome window mapped on 9 and the focused workspace
+  stayed 1 for ten seconds. Without `silent` it would drag the user along,
+  which for a tool whose whole job is tidying up behind somebody is the bug.
+- **`open_url` always launches a fresh `--app=` window.** Handing a bare URL to
+  the running Chrome opens a tab in an existing window and *activates* it,
+  which on Hyprland moves the user to that window's workspace (measured
+  elsewhere in this file: focused workspace flipped 1→2 within a second).
+- **`navigate_window` activates the window, and cannot help it.** The command
+  goes through `chrome-command.json` to the literate-tabs extension, whose
+  `handleHostMessage()` does `chrome.tabs.update` and then
+  `chrome.windows.update(win.id, { focused: true })`. Measured through this
+  server: the focused workspace went 1→8, the workspace the target window was
+  parked on. That focus is right for the omnibox chord the path was built for
+  (SUPER+L acts on the window in front of you) and wrong for an agent tidying
+  up, so the tool description says so and tells the agent to follow it with
+  `focus_workspace`. Do not "fix" it in the extension without checking
+  `Triage.qml`/`Proto.qml` first.
+- **There is no `focused` field on a `hyprctl clients` record.** The datum is
+  `focusHistoryID`: 0 is the focused window, 1 the one before it. An earlier
+  version read `c.get("focused")`, which is always `None`, so every window
+  reported unfocused and `focusedWindow` was always null -- a filter written on
+  a field that does not exist fails silently, same class of bug as
+  `HyprlandToplevel.appId`. Both `focused` and the raw `focusHistoryID` are
+  reported, because "which window did they use before this one" is a question
+  an agent actually asks.
+- **`chrome_urls` is honoured; `mcp_urls` overrides it.** The user has already
+  said how much of a URL may leave the machine, and an MCP client is strictly
+  more exposure than a local model call, so the MCP server must not silently
+  widen it. `mcp_urls` exists so widening is a deliberate act. The mode in
+  force is appended to the `list_chrome_tabs` description at `tools/list` time
+  (the `live=` hook on the `tool()` decorator) as well as returned in every
+  result -- a setting an agent finds out about only *after* it has asked is not
+  a disclosure.
+- **`list_chrome_tabs` attributes a report to a profile from disk.** The
+  extension's `email` is usually empty (`getProfileUserInfo()` returns nothing
+  for a profile that has not consented to sync, which is both profiles here),
+  so the join is the instance id, which physically lives under
+  `<user-data-dir>/<profile>/Local Extension Settings/<extension-id>/`.
+  Verified: `2c957f0c529040fa` → `Default`, `657dedacff66466f` → `Profile 1`.
+  Same technique as `tile-tabs-host`'s `resolve_profile()`, against a different
+  extension id. `email` stays the fallback for when Chrome does supply one.
+- **`rename_workspace` goes through `Namer.pin()`**, never a write to
+  `workspaces.json`. The daemon owns that file; a pin is the supported way to
+  make a name stick, and `show_pin_now()` already puts it on the bar without
+  waiting for a pass.
+- **`close_window` refuses without `confirm: true`** and says so in its
+  description. This is somebody's live desktop and an agent's second-best
+  guess at "the stale window" is the terminal it is running in.
+- `tools/test-mcp.py` speaks the protocol at the server over real stdio;
+  `--writes` also drives every write tool, on scratch workspaces 8 and 9, and
+  asserts the user is back where they started after each one. It is the only
+  test that proves any of this, because there is no client here to borrow.
+  Re-run it after touching the server -- and never point its scratch
+  workspaces at one somebody is on.
