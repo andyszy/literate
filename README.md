@@ -18,9 +18,9 @@ omarchy plugin add https://github.com/andyszy/literate.git --enable
 ~/.config/omarchy/plugins/literate/tools/install
 ```
 
-`tools/install` creates a venv with the Anthropic SDK, links the daemon into
-`~/.local/bin`, and prints the autostart line for you to paste. It edits
-nothing behind your back.
+`tools/install` creates a venv with the Anthropic SDK, links the daemon and
+the MCP server into `~/.local/bin`, and prints the autostart line and the
+`claude mcp add` line for you to paste. It edits nothing behind your back.
 
 Then give the daemon a credential: an API key in
 `~/.config/literate/api-key` (chmod 600, scoped to this daemon),
@@ -94,6 +94,44 @@ Choosing a spin-out changes the header to "Spin onto which workspace?" — press
 a digit 1-9 to pick the target. Escape backs out of either sub-mode first,
 then closes the menu.
 
+## The MCP server
+
+`bin/literate-mcp` hands the whole desktop to an agent over MCP -- every
+workspace, every window with its resolved app name and when it last had focus,
+Chrome's open tabs, the daemon's activity grouping, browsing history and past
+Claude Code conversations -- and lets it rearrange all of it.
+
+```bash
+claude mcp add literate -- ~/.local/bin/literate-mcp
+claude mcp list
+```
+
+Then: *"what am I in the middle of, and put it in a sane order"*.
+
+| Tool | What it does |
+|---|---|
+| `list_workspaces` | every workspace with its name, icon, pin state, monitor and windows (address, class, app, title, floating, focus order, last focused) |
+| `list_chrome_tabs` | Chrome's open windows and tabs, per profile |
+| `get_triage` | the daemon's precomputed "what am I doing" grouping, with its age |
+| `search_history` | Chrome history from the omnibox index, ranked on `typedCount` |
+| `search_conversations` | past Claude Code sessions, with the id and directory to resume in |
+| `list_chrome_profiles` | directory, display name, email, chip colours, which is primary |
+| `move_window` | move a window to a workspace; `follow: false` leaves you where you are |
+| `focus_window`, `focus_workspace` | go somewhere |
+| `rename_workspace`, `unpin_workspace` | name a workspace (through the daemon's pin mechanism) or hand it back to the model |
+| `open_url` | a new Chrome `--app=` window, in a named profile, optionally on another workspace without taking you there |
+| `navigate_window` | point an open Chrome window at a URL, keeping its place in the layout and the tab's back history |
+| `close_window` | refuses unless `confirm: true` |
+
+It is stdlib-only Python over stdio, imports `bin/literate-workspace-namer`
+for every path and every piece of desktop knowledge, and makes no model call
+of its own.
+
+**It reports as much of a Chrome URL as `chrome_urls` already allows** --
+`"domain"` by default, so hosts and no paths. Widening that for an agent has
+to be deliberate: set `mcp_urls` (see Tuning). Whichever is in force is named
+in the `list_chrome_tabs` tool description and in every result.
+
 ## Layout
 
 | What | Where |
@@ -102,6 +140,7 @@ then closes the menu.
 | Workspace widget | `Workspaces.qml` |
 | Hold-to-open action menu | `Overlay.qml` |
 | Daemon | `bin/literate-workspace-namer` (linked to `~/.local/bin`) |
+| MCP server | `bin/literate-mcp` (linked to `~/.local/bin`) |
 | Phosphor font + name→codepoint map | `fonts/Phosphor.ttf`, `phosphor-codepoints.json` (1530 icons) |
 | Prompt eval fixture | `fixtures/eval.json` |
 | Daemon config (optional) | `~/.config/literate/config.json` |
@@ -144,6 +183,7 @@ machine).
 
 | Key | Default | Meaning |
 |---|---|---|
+| `mcp_urls` | unset | How much of a URL `bin/literate-mcp` reports, overriding `chrome_urls` for the MCP server alone. Unset means "whatever `chrome_urls` says", which is the point: an agent is more exposure than a local model call, so widening has to be an explicit act. Same three values. |
 | `chrome_urls` | `"domain"` | How much of a Chrome window's URL the model sees, when the [literate-tabs extension](../../chrome-extensions/literate-tabs) is installed and reporting: `"domain"` sends only the registrable host (`mail.google.com`), never the path or query; `"full"` sends the whole URL; `"off"` sends nothing. Chrome's window title is always just the active tab's title — never the URL — so without the extension there is nothing to enrich and this key has no effect. |
 
 Chrome URLs never reach the daemon on their own: the `literate-tabs` Chrome
@@ -163,11 +203,25 @@ literate-workspace-namer --once      # one pass over the live desktop
 tail -f ~/.local/state/literate/daemon.log
 ```
 
+And the MCP server, driven over real stdio the way a client drives it:
+
+```bash
+python3 tools/test-mcp.py            # read tools only
+python3 tools/test-mcp.py --writes   # also the write tools, on scratch workspaces
+literate-mcp --tools                 # just print the tool list
+```
+
 ## Privacy
 
 Window classes and titles for every workspace go to the model. Titles can
 carry email subjects, document names, URLs. Use `ignore_classes` to keep an
 app out entirely, or the `local` backend to keep everything on the machine.
+
+`bin/literate-mcp` is the widest exposure of the lot, because it hands an
+agent the omnibox index (all of Chrome's history, every past conversation's
+title) on request. It is opt-in twice over: nothing runs until you
+`claude mcp add` it, and its URL reporting follows `chrome_urls` unless you
+set `mcp_urls` yourself.
 
 With the `literate-tabs` Chrome extension installed, Chrome windows can also
 send URL information — see `chrome_urls` above. It defaults to `"domain"`
