@@ -241,6 +241,10 @@ Item {
 
   function settle() {
     if (!root.opened) return
+    // A handoff has already refocused the parent on purpose. Every rule below
+    // reads that as the user walking away and would close the proto in the
+    // middle of the one moment it exists to cover.
+    if (root.handingOff) return
     // Nothing to lose until something has been had. The proto is created and
     // THEN mapped and focused, so for the first frames of its life the focused
     // window is legitimately still the parent -- and a dismiss rule that does
@@ -389,6 +393,9 @@ Item {
   Connections {
     target: Hyprland.toplevels
     function onValuesChanged() {
+      // During a handoff the proto is deliberately still open, so this has to
+      // be asked before the `opened` test, not after it.
+      if (root.handingOff) { root.checkHandoffLanded(); return }
       if (!root.opened) { root.checkLaunchReady(); return }
       root.resolveSelf()
     }
@@ -434,7 +441,148 @@ Item {
   property bool pendingNeedsParent: false
   property var afterParentFocus: null
 
+  // ------------------------------------------------------ the Enter handoff
+  //
+  // What Enter looks like has to be ONE movement. The straightforward order --
+  // close the proto, wait for it to be gone, refocus the parent, launch -- is
+  // three sequential steps and the user sees all three: the slot empties and
+  // dwindle reflows to fill it, then nothing happens for however long Chrome
+  // takes to start, then the new window maps and dwindle splits back. An empty
+  // slot, a pause, and two reflows, on the one surface whose entire promise is
+  // that what you asked for arrives where the omnibox already is.
+  //
+  // So the proto does not leave. It FLOATS ITSELF on the geometry it already
+  // has, which takes it out of the tiling layout without moving a pixel of it.
+  // Two things fall out. Dwindle's target goes back to being the parent, so
+  // the new window gets exactly the slot that was being previewed -- the same
+  // reason the old order refocused the parent, reached without waiting for an
+  // unmap. And the reflow that follows happens UNDERNEATH a surface that is
+  // still covering it, so the layout settles out of sight. The launch is fired
+  // as soon as focus has landed, so Chrome's startup overlaps the teardown
+  // instead of queueing behind it, and the proto is closed only once the new
+  // window has actually mapped -- revealing a layout that is already finished.
+  //
+  // Falls back to the old close-first order whenever the geometry or the
+  // parent is unknown, which is the honest answer for an empty workspace:
+  // there is no slot to hold and nothing to cover.
+  property bool handingOff: false
+  property var knownAddresses: null
+
+  function protoGeometry() {
+    var want = Omnibox.normalizeAddress(root.protoAddress || "")
+    if (!want) return null
+    var tls = (Hyprland.toplevels && Hyprland.toplevels.values)
+      ? Hyprland.toplevels.values : []
+    for (var i = 0; i < tls.length; i++) {
+      var t = tls[i]
+      if (!t || Omnibox.normalizeAddress(t.address) !== want) continue
+      var io = t.lastIpcObject || ({})
+      if (!io.at || !io.size) return null
+      return [io.at[0], io.at[1], io.size[0], io.size[1]]
+    }
+    return null
+  }
+
+  function snapshotAddresses() {
+    var seen = {}
+    var tls = (Hyprland.toplevels && Hyprland.toplevels.values)
+      ? Hyprland.toplevels.values : []
+    for (var i = 0; i < tls.length; i++)
+      if (tls[i]) seen[Omnibox.normalizeAddress(tls[i].address)] = true
+    return seen
+  }
+
+  function handoff(fn) {
+    if (root.floatingMode) return false
+    var rect = root.protoGeometry()
+    if (!rect || !root.parentAddress) return false
+    root.handingOff = true
+    root.pendingLaunch = fn
+    root.knownAddresses = root.snapshotAddresses()
+    settleTimer.stop()
+    // One batch, and the same size-before-position rule placeIfFloating
+    // documents: resize keeps the window's centre, so moving first and
+    // resizing after drags it off the point it was just put on.
+    var d = [
+      'dispatch hl.dsp.window.float({ action = "on", window = "address:'
+        + root.protoAddress + '" })',
+      'dispatch hl.dsp.window.resize({ x = ' + Math.round(rect[2])
+        + ', y = ' + Math.round(rect[3])
+        + ', window = "address:' + root.protoAddress + '" })',
+      'dispatch hl.dsp.window.move({ x = ' + Math.round(rect[0])
+        + ', y = ' + Math.round(rect[1])
+        + ', window = "address:' + root.protoAddress + '" })',
+      'dispatch hl.dsp.focus({ window = "address:' + root.parentAddress + '" })'
+    ]
+    handoffProc.command = ["hyprctl", "--batch", d.join(" ; ")]
+    handoffProc.running = true
+    handoffFallbackTimer.restart()
+    return true
+  }
+
+  // The new window has mapped (or we have waited long enough for one). Only
+  // now does the proto go, and going is the only visible change left.
+  function endHandoff() {
+    if (!root.handingOff) return
+    root.handingOff = false
+    root.knownAddresses = null
+    handoffFallbackTimer.stop()
+    root.close()
+    root.closeRequested()
+  }
+
+  function checkHandoffLanded() {
+    if (!root.handingOff || !root.knownAddresses || root.pendingLaunch) return
+    var tls = (Hyprland.toplevels && Hyprland.toplevels.values)
+      ? Hyprland.toplevels.values : []
+    var mine = Omnibox.normalizeAddress(root.protoAddress || "")
+    for (var i = 0; i < tls.length; i++) {
+      if (!tls[i]) continue
+      var a = Omnibox.normalizeAddress(tls[i].address)
+      if (a === mine || root.knownAddresses[a]) continue
+      root.endHandoff()
+      return
+    }
+  }
+
+  Process {
+    id: handoffProc
+    stdout: SplitParser {
+      onRead: function(l) { if (String(l||"").trim()) console.warn("literate proto handoff:", l) }
+    }
+    onExited: function() {
+      // Focus has landed, so dwindle will split the parent rather than us.
+      var fn = root.pendingLaunch
+      root.pendingLaunch = null
+      if (fn) fn()
+    }
+  }
+
+  // Chrome cold-starting, or a launch that produces no window at all. Either
+  // way the proto cannot stay up forever waiting to be relieved.
+  Timer {
+    id: handoffFallbackTimer
+    interval: 2500
+    repeat: false
+    onTriggered: root.endHandoff()
+  }
+
+  // A map is not a signal Quickshell gets told about directly -- the same
+  // reason resolveTimer exists. Waiting only on onValuesChanged here would
+  // leave the proto up until the 2500 ms backstop on the runs where the
+  // signal does not arrive, which is the visible half of the bug.
+  Timer {
+    interval: 40
+    repeat: true
+    running: root.handingOff
+    onTriggered: {
+      Hyprland.refreshToplevels()
+      root.checkHandoffLanded()
+    }
+  }
+
   function runAfterClose(fn, needsParent) {
+    if (needsParent && root.handoff(fn)) return
     root.pendingLaunch = fn
     root.pendingNeedsParent = !!needsParent
     launchFallbackTimer.restart()
