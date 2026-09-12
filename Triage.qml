@@ -399,11 +399,21 @@ Item {
   function openUrlInBrowser(url, secondary) {
     if (url && root.canReplace && !secondary) { root.navigateFocused(url); return }
     var profile = secondary ? root.shiftProfile : root.enterProfile
-    var target = url ? (" " + Util.shellQuote(url)) : " --new-window"
+    // --app=, never a bare URL. Handing a URL to the already-running Chrome
+    // makes it open a TAB in some existing window of that profile and
+    // ACTIVATE that window, which on Hyprland drags the user to whatever
+    // workspace that window lives on -- so the real window appears nowhere
+    // near the slot that was just previewed. Measured from workspace 1 with a
+    // Chrome window sitting on workspace 2: the focused workspace flipped to 2
+    // within a second and the window landed there; the identical launch with
+    // --app= stayed on workspace 1. A fresh process also skips the tile-tabs
+    // tab->app conversion altogether, so there is no tab to flicker past.
+    var target = url ? (" --app=" + Util.shellQuote(url)) : " --new-window"
     var cmd = (profile && profile.dir)
       ? ("setsid uwsm-app -- google-chrome-stable --profile-directory="
          + Util.shellQuote(profile.dir) + target)
-      : ("omarchy launch browser" + target)
+      : (url ? ("setsid uwsm-app -- google-chrome-stable" + target)
+             : ("omarchy launch browser" + target))
     launchProc.command = ["hyprctl", "dispatch", root.execCmdDispatch(cmd)]
     launchProc.running = true
   }

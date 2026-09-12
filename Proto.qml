@@ -629,8 +629,8 @@ Item {
   function actionLabel() {
     var base = root.queryAction ? root.queryAction.label : ""
     if (!base || root.target !== "current" || root.queryAction.kind === "window") return base
-    return base + (root.canReplace ? " — in this window"
-                                   : " — in a new window (nothing to replace)")
+    return base + (root.canReplace ? " — navigate this window"
+                                   : " — in a new window (nothing to navigate)")
   }
 
   function opensInBrowser() {
@@ -644,7 +644,7 @@ Item {
     var secondary = root.profileName(root.shiftProfile)
     var suffix = (root.chromeProfiles.length > 2) ? " (⌃⇥ next)" : ""
     if (root.opensInBrowser() && root.canReplace)
-      return "⏎ replace this window"
+      return "⏎ navigate this window"
         + (secondary ? "    ⇧⏎ " + secondary + " (new window)" : "")
     if (root.opensInBrowser() && primary)
       return "⏎ " + primary + (secondary ? " · ⇧⏎ " + secondary : "") + suffix
@@ -694,11 +694,21 @@ Item {
   function openUrlInBrowser(url, secondary) {
     if (url && root.canReplace && !secondary) { root.navigateParent(url); return }
     var profile = secondary ? root.shiftProfile : root.enterProfile
-    var arg = url ? (" " + Util.shellQuote(url)) : " --new-window"
+    // --app=, never a bare URL. Handing a URL to the already-running Chrome
+    // makes it open a TAB in some existing window of that profile and
+    // ACTIVATE that window, which on Hyprland drags the user to whatever
+    // workspace that window lives on -- so the real window appears nowhere
+    // near the slot that was just previewed. Measured from workspace 1 with a
+    // Chrome window sitting on workspace 2: the focused workspace flipped to 2
+    // within a second and the window landed there; the identical launch with
+    // --app= stayed on workspace 1. A fresh process also skips the tile-tabs
+    // tab->app conversion altogether, so there is no tab to flicker past.
+    var arg = url ? (" --app=" + Util.shellQuote(url)) : " --new-window"
     root.launch((profile && profile.dir)
       ? ("setsid uwsm-app -- google-chrome-stable --profile-directory="
          + Util.shellQuote(profile.dir) + arg)
-      : ("omarchy launch browser" + arg))
+      : (url ? ("setsid uwsm-app -- google-chrome-stable" + arg)
+             : ("omarchy launch browser" + arg)))
   }
 
   // Claude Code writes the conversation's ai-title into its terminal's window
