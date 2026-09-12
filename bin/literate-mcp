@@ -46,6 +46,22 @@ URL_MAX = 4096
 RE_ADDRESS = re.compile(r"^0x[0-9a-f]{1,16}$")
 RE_WORKSPACE = re.compile(r"^[0-9]{1,4}$")
 
+# open_url's placement rule (`hl.dsp.exec_cmd(cmd, { workspace = "N silent" })`)
+# tracks the LAUNCHING PROCESS, not the window. That is correct when Chrome
+# was not already running -- the launched process is the one that maps the
+# window. But `google-chrome-stable --app=<url>` against an ALREADY-RUNNING
+# Chrome just signals the existing browser process and exits; the window is
+# created by that other, untracked process, and Hyprland's rule silently
+# misses it. Measured both ways on this machine: a cold Chrome landed the
+# window on the requested workspace every time, a warm one landed it on the
+# focused workspace every time, with the dispatch itself still answering
+# "ok" in both cases. So when a workspace is requested, open_url polls for
+# the window it just asked for and moves it explicitly if the rule missed --
+# see _launched_window_address(). This is an MCP tool and must return
+# promptly, so the poll has a hard ceiling rather than waiting indefinitely.
+OPEN_URL_PLACEMENT_TIMEOUT = 4.0  # seconds
+OPEN_URL_POLL_INTERVAL = 0.15  # seconds
+
 
 # --------------------------------------------------------------- the daemon
 
@@ -196,6 +212,46 @@ def clients_by_address():
     plugin's layer surfaces holds the keyboard.
     """
     return {D.normalize_address(c.get("address")): c for c in D.hyprctl("clients")}
+
+
+def _launched_window_address(before, host, profile_dir, timeout, interval):
+    """Poll `hyprctl clients` for the window open_url just launched.
+
+    `before` is the set of normalized addresses that existed right before the
+    launch. A candidate has to be a NEW address AND look like the window we
+    asked for: a Chrome site-app class ending in the right profile directory
+    (`chrome-<host>__<path>-<Profile>` -- see RE_CLASS_PROFILE/RE_PWA_CLASS in
+    the daemon) and, when the URL has a host, that host too. Matching on more
+    than "a new address showed up" is what keeps this from grabbing a window
+    the user happened to open by hand in the same second instead of the one
+    we launched.
+
+    Returns the address, or None if nothing matched before `timeout` runs
+    out -- never raises and never waits past the deadline, because this is
+    called from an MCP tool that has to answer promptly either way.
+    """
+    deadline = time.time() + timeout
+    want_profile = str(profile_dir or "Default").lower()
+    want_host = (host or "").lower()
+    while True:
+        for c in D.hyprctl("clients"):
+            addr = D.normalize_address(c.get("address"))
+            if addr in before:
+                continue
+            cls = str(c.get("class") or "")
+            match = D.RE_CLASS_PROFILE.search(cls)
+            if not match or match.group(1).replace("_", " ").lower() != want_profile:
+                continue
+            if want_host:
+                pwa = D.RE_PWA_CLASS.match(cls)
+                if not pwa or pwa.group("host").lower() != want_host:
+                    continue
+            elif not cls.lower().startswith("chrome-"):
+                continue
+            return addr
+        if time.time() >= deadline:
+            return None
+        time.sleep(interval)
 
 
 # ------------------------------------------------------------- chrome urls
@@ -617,7 +673,22 @@ def unpin_workspace(args):
       "it open a tab in some existing window AND ACTIVATE that window, which "
       "on Hyprland drags the user to that window's workspace (measured: the "
       "focused workspace flipped within a second). `--app=` stays put. To put "
-      "a URL in an EXISTING window instead, use navigate_window.",
+      "a URL in an EXISTING window instead, use navigate_window. WHEN A "
+      "WORKSPACE IS REQUESTED: placement is not guaranteed by the launch "
+      "alone. The exec rule that asks Hyprland to put the window there tracks "
+      "the LAUNCHING PROCESS, and if Chrome is already running that process "
+      "just signals the existing browser and exits -- the window is actually "
+      "created by a different, untracked process, and the rule silently "
+      "misses (measured: a cold Chrome placed correctly every time, a warm "
+      "one landed on the current workspace every time, `hl.dsp.exec_cmd` "
+      f"answering \"ok\" either way). So this tool polls up to "
+      f"{OPEN_URL_PLACEMENT_TIMEOUT:g}s for the window it just asked for "
+      "and moves it explicitly, silently, if the rule missed. Check `placed` "
+      "in the result -- true means the window was found and is confirmed on "
+      "the requested workspace; false means no matching window turned up in "
+      "time and it may be sitting on the current workspace instead. No "
+      "workspace requested means no polling happens at all: the window lands "
+      "wherever the user already is, which needs no confirming.",
       obj({"url": {"type": "string", "description": "http://, https:// or file://"},
            "profile": {"type": "string", "description": "Chrome profile "
                        "directory or display name, from list_chrome_profiles; "
@@ -643,14 +714,57 @@ def open_url(args):
     if picked:
         command += " --profile-directory=" + shlex.quote(picked["dir"])
     command += " --app=" + shlex.quote(url)
+
+    ws = None
     rules = None
     if args.get("workspace"):
+        ws = check_workspace(args["workspace"])
         # "silent" is the whole point: the window lands there and the user is
-        # not taken along.
-        rules = {"workspace": check_workspace(args["workspace"]) + " silent"}
+        # not taken along. Kept even though it is unreliable with a warm
+        # Chrome (see the tool description) -- it is free, and it is still
+        # what places the window correctly on a cold one.
+        rules = {"workspace": ws + " silent"}
+
+    # Snapshot BEFORE the launch, and only when there is something to poll
+    # for -- an unrequested workspace means the window landing on the
+    # current one is already correct, and this tool must not spend time
+    # confirming a thing that needs no confirming.
+    before = None
+    if ws:
+        before = {D.normalize_address(c.get("address")) for c in D.hyprctl("clients")}
+
     exec_cmd(command, rules)
-    return {"opened": url, "profile": (picked or {}).get("dir"),
-            "workspace": args.get("workspace") or "current", "command": command}
+
+    result = {"opened": url, "profile": (picked or {}).get("dir"),
+              "workspace": args.get("workspace") or "current", "command": command}
+
+    if ws:
+        host = D.registrable_domain(url) or ""
+        profile_dir = (picked or {}).get("dir") or "Default"
+        address = _launched_window_address(before, host, profile_dir,
+                                           OPEN_URL_PLACEMENT_TIMEOUT,
+                                           OPEN_URL_POLL_INTERVAL)
+        if address is None:
+            result["placed"] = False
+            result["note"] = (
+                f"no matching window appeared within "
+                f"{OPEN_URL_PLACEMENT_TIMEOUT:g}s, so placement on workspace "
+                f"{ws} is NOT confirmed -- it may be on the current "
+                "workspace instead. Chrome's own process, not the launcher, "
+                "creates the window when Chrome is already running, so the "
+                "exec rule can silently miss; check list_workspaces and "
+                "move_window it yourself if this happened.")
+        else:
+            try:
+                dispatch(f'hl.dsp.window.move({{ workspace = "{ws}", '
+                         f'follow = false, window = "address:{address}" }})')
+                result["placed"] = True
+                result["address"] = address
+            except ToolError as e:
+                result["placed"] = False
+                result["address"] = address
+                result["note"] = (f"found the window but the move failed: {e}")
+    return result
 
 
 @tool("navigate_window",
