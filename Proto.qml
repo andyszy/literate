@@ -156,6 +156,9 @@ Item {
   function open(payload) {
     var p = payload || ({})
     root.opened = true
+    // Read now, while there is time. The handoff needs them the instant Enter
+    // is pressed and must not pay an IPC round trip for them then.
+    root.readAnimations()
     root.target = (String(p.target || "") === "current") ? "current" : "new"
     root.parentAddress = ""
     root.parentClass = ""
@@ -193,6 +196,10 @@ Item {
   function close() {
     root.opened = false
     settleTimer.stop()
+    // Belt and braces. endHandoff() restores them on the normal path, but
+    // every way out of this surface goes through close(), and a desktop left
+    // with its animations off is a far worse bug than a stutter.
+    root.restoreAnimations()
     window.visible = false
   }
 
@@ -443,45 +450,37 @@ Item {
 
   // ------------------------------------------------------ the Enter handoff
   //
-  // What Enter looks like has to be ONE movement. The straightforward order --
-  // close the proto, wait for it to be gone, refocus the parent, launch -- is
-  // three sequential steps and the user sees all three: the slot empties and
-  // dwindle reflows to fill it, then nothing happens for however long Chrome
-  // takes to start, then the new window maps and dwindle splits back. An empty
-  // slot, a pause, and two reflows, on the one surface whose entire promise is
-  // that what you asked for arrives where the omnibox already is.
+  // What Enter looks like has to be ONE movement, and the thing that ruins it
+  // is not the proto leaving -- it is THE PARENT RESIZING. On a workspace
+  // holding one terminal, the obvious orders all make that terminal grow to
+  // full width and shrink back: close the proto and dwindle reflows to fill
+  // the gap, or float the proto out of the layout and dwindle does the same
+  // thing behind it. Either way a terminal re-lays-out its text twice, and it
+  // sits at the wrong width for however long Chrome takes to start. That is
+  // the stutter, and hiding it behind a floating surface does not fix it
+  // because the parent is not underneath that surface, it is beside it.
   //
-  // So the proto does not leave. It FLOATS ITSELF on the geometry it already
-  // has, which takes it out of the tiling layout without moving a pixel of it.
-  // Two things fall out. Dwindle's target goes back to being the parent, so
-  // the new window gets exactly the slot that was being previewed -- the same
-  // reason the old order refocused the parent, reached without waiting for an
-  // unmap. And the reflow that follows happens UNDERNEATH a surface that is
-  // still covering it, so the layout settles out of sight. The launch is fired
-  // as soon as focus has landed, so Chrome's startup overlaps the teardown
-  // instead of queueing behind it, and the proto is closed only once the new
-  // window has actually mapped -- revealing a layout that is already finished.
+  // So nothing is moved out of the layout and focus is not handed anywhere.
+  // The proto stays TILED AND FOCUSED, and the launch goes out immediately.
+  // Dwindle splits the focused window, which is the proto, so the new window
+  // takes half of the PROTO'S OWN SLOT and every other window on the screen
+  // keeps its geometry to the pixel. Closing the proto the moment the new
+  // window maps lets it expand into the whole slot -- exactly the rectangle
+  // that was being previewed. The entire transition is confined to the
+  // omnibox's own rectangle.
   //
-  // Falls back to the old close-first order whenever the geometry or the
-  // parent is unknown, which is the honest answer for an empty workspace:
-  // there is no slot to hold and nothing to cover.
+  // Window animations are suppressed across that window and restored after,
+  // because the residue is a shrink-to-half immediately reversed by an
+  // expand-to-full: interrupted mid-flight it reads as a squeeze, and played
+  // instantly it is a frame nobody sees. Snapshotted from `hyprctl animations`
+  // and restored to the values that were actually in force, never to defaults.
+  // Every exit path restores them, including the backstop timer, because
+  // leaving a desktop with animations off is a far worse bug than a stutter.
+  //
+  // Falls back to the old close-first order when the proto's own address is
+  // not known yet -- there is nothing to keep focused and nothing to close.
   property bool handingOff: false
   property var knownAddresses: null
-
-  function protoGeometry() {
-    var want = Omnibox.normalizeAddress(root.protoAddress || "")
-    if (!want) return null
-    var tls = (Hyprland.toplevels && Hyprland.toplevels.values)
-      ? Hyprland.toplevels.values : []
-    for (var i = 0; i < tls.length; i++) {
-      var t = tls[i]
-      if (!t || Omnibox.normalizeAddress(t.address) !== want) continue
-      var io = t.lastIpcObject || ({})
-      if (!io.at || !io.size) return null
-      return [io.at[0], io.at[1], io.size[0], io.size[1]]
-    }
-    return null
-  }
 
   function snapshotAddresses() {
     var seen = {}
@@ -494,30 +493,121 @@ Item {
 
   function handoff(fn) {
     if (root.floatingMode) return false
-    var rect = root.protoGeometry()
-    if (!rect || !root.parentAddress) return false
+    if (!root.protoAddress) return false
     root.handingOff = true
-    root.pendingLaunch = fn
     root.knownAddresses = root.snapshotAddresses()
     settleTimer.stop()
-    // One batch, and the same size-before-position rule placeIfFloating
-    // documents: resize keeps the window's centre, so moving first and
-    // resizing after drags it off the point it was just put on.
-    var d = [
-      'dispatch hl.dsp.window.float({ action = "on", window = "address:'
-        + root.protoAddress + '" })',
-      'dispatch hl.dsp.window.resize({ x = ' + Math.round(rect[2])
-        + ', y = ' + Math.round(rect[3])
-        + ', window = "address:' + root.protoAddress + '" })',
-      'dispatch hl.dsp.window.move({ x = ' + Math.round(rect[0])
-        + ', y = ' + Math.round(rect[1])
-        + ', window = "address:' + root.protoAddress + '" })',
-      'dispatch hl.dsp.focus({ window = "address:' + root.parentAddress + '" })'
-    ]
-    handoffProc.command = ["hyprctl", "--batch", d.join(" ; ")]
-    handoffProc.running = true
     handoffFallbackTimer.restart()
+    // Suppress first, launch second, and do not wait on the suppression: it is
+    // a nicety, and making Chrome's startup queue behind an IPC round trip to
+    // buy it would cost more than it saves.
+    root.suppressAnimations()
+    fn()
     return true
+  }
+
+  // ------------------------------------------------------------- animations
+  //
+  // Read once when the proto opens, so the handoff has them without a round
+  // trip, and so a leaf that was never overridden is put back with the values
+  // it was actually inheriting rather than with a guess.
+  property var animSnapshot: null
+  property bool animSuppressed: false
+  readonly property var animLeaves: ["windows", "windowsIn", "windowsOut", "windowsMove"]
+
+  function readAnimations() {
+    animReadProc.running = true
+  }
+
+  // Only leaves the config actually SETS can be touched. An inherited leaf
+  // reports speed 0, and hl.animation refuses to enable anything without a
+  // speed -- so putting one back is not possible and the attempt leaves it
+  // disabled at a default it never had. (Measured: restoring windowsMove that
+  // way answered `missing required field "speed"` and left it off at speed 1,
+  // bezier default.) Inherited leaves need no handling anyway: they follow
+  // whatever their parent is doing, and the parent is in this list.
+  function animTouchable(leaf) {
+    var spec = (root.animSnapshot || ({}))[leaf]
+    return !!(spec && spec.overridden && spec.speed > 0)
+  }
+
+  function animCommand(leaf, spec) {
+    var parts = ['leaf = "' + leaf + '"']
+    if (!spec) { parts.push("enabled = false") }
+    else {
+      parts.push("enabled = " + (spec.enabled ? "true" : "false"))
+      parts.push("speed = " + spec.speed)
+      if (spec.bezier) parts.push('bezier = "' + spec.bezier + '"')
+      if (spec.style) parts.push('style = "' + spec.style + '"')
+    }
+    return "eval hl.animation({ " + parts.join(", ") + " })"
+  }
+
+  function suppressAnimations() {
+    if (root.animSuppressed || !root.animSnapshot) return
+    root.animSuppressed = true
+    var d = []
+    for (var i = 0; i < root.animLeaves.length; i++)
+      if (root.animTouchable(root.animLeaves[i]))
+        d.push(root.animCommand(root.animLeaves[i], null))
+    if (!d.length) { root.animSuppressed = false; return }
+    animProc.command = ["hyprctl", "--batch", d.join(" ; ")]
+    animProc.running = true
+  }
+
+  function restoreAnimations() {
+    if (!root.animSuppressed) return
+    root.animSuppressed = false
+    var snap = root.animSnapshot || ({})
+    var d = []
+    for (var i = 0; i < root.animLeaves.length; i++) {
+      var leaf = root.animLeaves[i]
+      if (!root.animTouchable(leaf)) continue
+      d.push(root.animCommand(leaf, snap[leaf]))
+    }
+    if (!d.length) return
+    animRestoreProc.command = ["hyprctl", "--batch", d.join(" ; ")]
+    animRestoreProc.running = true
+  }
+
+  Process {
+    id: animReadProc
+    command: ["hyprctl", "animations", "-j"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var raw = JSON.parse(this.text)
+          var rows = Array.isArray(raw) ? (Array.isArray(raw[0]) ? raw[0] : raw) : []
+          var out = {}
+          for (var i = 0; i < rows.length; i++) {
+            var r = rows[i]
+            if (!r || !r.name) continue
+            out[String(r.name)] = { enabled: !!r.enabled, speed: Number(r.speed) || 0,
+                                    bezier: String(r.bezier || ""), style: String(r.style || ""),
+                                    overridden: !!r.overridden }
+          }
+          root.animSnapshot = out
+        } catch (e) {
+          // No snapshot means no suppression. A missed nicety, never a desktop
+          // left with its animations off.
+          root.animSnapshot = null
+        }
+      }
+    }
+  }
+
+  Process {
+    id: animProc
+    stdout: SplitParser {
+      onRead: function(l) { if (String(l||"").trim() !== "ok") console.warn("literate proto anim:", l) }
+    }
+  }
+
+  Process {
+    id: animRestoreProc
+    stdout: SplitParser {
+      onRead: function(l) { if (String(l||"").trim() !== "ok") console.warn("literate proto anim restore:", l) }
+    }
   }
 
   // The new window has mapped (or we have waited long enough for one). Only
@@ -527,6 +617,7 @@ Item {
     root.handingOff = false
     root.knownAddresses = null
     handoffFallbackTimer.stop()
+    root.restoreAnimations()
     root.close()
     root.closeRequested()
   }
@@ -542,19 +633,6 @@ Item {
       if (a === mine || root.knownAddresses[a]) continue
       root.endHandoff()
       return
-    }
-  }
-
-  Process {
-    id: handoffProc
-    stdout: SplitParser {
-      onRead: function(l) { if (String(l||"").trim()) console.warn("literate proto handoff:", l) }
-    }
-    onExited: function() {
-      // Focus has landed, so dwindle will split the parent rather than us.
-      var fn = root.pendingLaunch
-      root.pendingLaunch = null
-      if (fn) fn()
     }
   }
 
