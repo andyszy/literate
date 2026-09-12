@@ -700,6 +700,12 @@ The sticking point is the mapping, and Hyprland's own module solves it:
   working. Duck-type (`typeof x.length === "number"`) for anything read off a
   delegate's `modelData`; `Array.isArray` is still fine on a plain `var`
   property like the parsed index itself.
+- **`HyprlandToplevel` has no `appId`.** It reads `undefined`, and a filter
+  written on it therefore rejects every row in silence. That is not a small
+  bug to find: `Proto.qml` looked for its own window by app-id and never found
+  it, so it could neither follow a workspace change nor be moved at all, with
+  nothing in any log. The class is in `lastIpcObject` (the raw `hyprctl -j
+  clients` record) along with everything else hyprctl reports.
 - `HyprlandToplevel.address` has **no `0x` prefix**; `hyprctl` and the daemon
   both write `0xaaaa...`. Everything goes through
   `Omnibox.normalizeAddress()`, same rule as the daemon's own
@@ -715,6 +721,117 @@ frame is not one anybody can pick out during a glance; a fan spinning up is.
 `captureFrame()` is not an alternative to priming: called before the capture
 session exists it warns "no recording context is ready" and returns nothing,
 and there is no signal for when that becomes true.
+
+## The tiled omnibox
+
+`Proto.qml` is the omnibox as a **real tiled window** rather than an overlay:
+where it lands IS the preview of where the window you are about to open will
+land. Summoned with `{"mode":"proto","target":"new"|"current"}`, mounted by
+`Overlay.qml` like `Triage.qml` and `Shelf.qml`, and in `tools/sync-upstream`'s
+`--exclude` list like both.
+
+- **A layer surface cannot tile; an XDG toplevel can.** Everything else this
+  plugin draws is a layer surface, which the compositor keeps out of the layout
+  by definition. Quickshell's `FloatingWindow` is a real toplevel -- the type
+  `plugins/dev-gallery/GalleryPanel.qml` already uses -- so it joins the
+  layout like anything else.
+- **dwindle splits the FOCUSED window**, so a toplevel opened while window W
+  has focus takes exactly the half the next window would have taken. Nothing
+  is simulated. But the preview only stays honest if the same window has focus
+  when the real thing launches: record the window that was focused at the
+  moment the proto opened, and refocus it explicitly before launching.
+  Verified on a scratch workspace with focus deliberately scrambled in
+  between -- proto at `[206,46] 173x225`, real window at `[206,46] 173x225`.
+  A Chrome window in the same slot measures 28px shorter and 28px lower: that
+  is the hyprbars band it carries and the proto deliberately does not, so the
+  *tile* is identical and the client area differs by the decoration.
+- **The refocus has to have LANDED before the launch is spawned.** Two hyprctl
+  processes started back to back are two races, and losing that one puts the
+  window somewhere the preview never showed, so the launch hangs off the
+  refocus process exiting. Batching both into one `hyprctl --batch` would be
+  cheaper, but the batch separator is `;` and a launch command carries a
+  user-typed URL.
+- **Nothing can tell two Quickshell windows apart from outside.** Quickshell
+  sets the Wayland app_id once for the whole process (`org.quickshell`) and
+  `FloatingWindowInterface` has no per-window app-id. Worse, a window rule
+  cannot match on the title either: **Hyprland evaluates window rules before a
+  Quickshell window's title reaches it**. A foot window with
+  `initial_title = "^floatme"` floats; an identically-titled Quickshell
+  FloatingWindow does not -- while `hyprctl clients` still reports the
+  expected `initialTitle` afterwards, so it reads exactly like a rule that
+  should have matched and didn't. Only a **class** rule can reach these
+  windows, which is what `~/.config/hypr/literate-omnibox.lua` uses.
+  (`hl.window_rule` spells the keys `initial_title`/`initial_class`;
+  `initialTitle` is rejected outright, which is the better failure.)
+- So `target: "current"` **floats itself**, imperatively, once it knows its own
+  address -- a rule could not tell the two modes apart. The cost is stated
+  rather than hidden: that proto maps tiled for a frame or two, so the layout
+  reflows out and back. Only the replace mode pays it, and the replace mode is
+  the one whose placement is not a preview of anything.
+- **`hl.dsp.window.resize` keeps the window's CENTRE**, so size before
+  position or the window is dragged off the point you just put it on by half
+  the size change (asked for `x=14`, landed at `x=-164`). And float with
+  `action = "on"`, never a bare toggle: the placement runs off a signal that
+  can arrive twice.
+- **Follow vs. dismiss is one race, and it is 1 ms wide.** The proto dismisses
+  on focus loss and follows the user across workspaces, and a workspace switch
+  is both. Measured against a wall clock: clicking away changes
+  `Hyprland.activeToplevel` ~2 ms later and does *not* change
+  `focusedWorkspace`; switching to an occupied workspace changes both, 1 ms
+  apart, **focus loss first**; switching to an EMPTY workspace changes only
+  `focusedWorkspace` and leaves `activeToplevel` stale, because Hyprland's
+  `activewindowv2` carries an empty payload there and Quickshell ignores it.
+  So the follow must be driven off the workspace change as well, and the
+  dismiss deferred: **150 ms**, two orders of magnitude above the gap the race
+  needs and under the ~200 ms at which a dismissal stops reading as immediate.
+  Measured end to end at 163-181 ms from click-away to gone.
+- **Judge "is that me?" on the title, never on the address.** The address is
+  resolved from a list that fills asynchronously, so for the first moments of
+  the proto's life we do not know our own address -- and the obvious address
+  test then reads "the focused window is not me" and closes the proto ~150 ms
+  after it opens, every time.
+- **And arm the dismiss only after the proto has actually held focus.** It is
+  created and *then* mapped and focused, so the focused window is legitimately
+  still the parent for the first frames. Without that gate the same
+  instant-self-close comes back by a different route.
+- **After following, RE-RECORD the parent.** The proto arriving on a new
+  workspace splits whatever is focused *there*, so the old parent describes a
+  slot nobody is looking at. Proven: the same proto moved to an empty
+  workspace took the whole area, and moving it back landed it in a different
+  slot than the one it started in.
+- **`SUPER+SHIFT+<n>` has to be shadowed, and a submap is exclusive.** Moving a
+  transient menu to another workspace without the user is meaningless, but the
+  submap that swallows those chords also kills every other global bind --
+  including the plain `SUPER+<n>` workspace switch the follow behaviour exists
+  to serve. So the proto's runtime submap re-binds `SUPER+code:10..19` as well
+  as binding `SUPER+SHIFT+` those to `hl.dsp.no_op()`. Same generation-name
+  rule as the shelf's submap, and the same ban on binding plain Escape.
+- **A hot reload brings the window back.** Quickshell hands a reloaded
+  instance the old one's property values, `visible` included, so a proto that
+  was up when any file in this plugin changed returns as a window nobody
+  summoned -- mapped before `open()` ran, so without even its title.
+  `Component.onCompleted` forces it closed. Note also that writing into this
+  plugin directory at all trips omarchy's reloader, which segfaults the shell
+  (a `dynamic_cast` in `QQmlObjectCreator::finalize` over a destroyed Bar
+  type): **`omarchy restart shell` after every edit**, and judge nothing from
+  a hot reload.
+- **`Overlay.open()` tears down the mode it is replacing.** Leaving the old
+  mode running was survivable while every mode was a layer surface that simply
+  stopped being visible; the proto is a real window, and left behind it is a
+  window nobody summoned sitting in somebody's layout.
+- **It is a real window, so it shows up in window lists -- including ours.**
+  `org.quickshell` is in the daemon's `ignore_classes`, which keeps it out of
+  `_filtered_clients()` and therefore out of the naming prompt, `--triage` and
+  the omnibox's open-window tier (verified with a proto open: hyprctl sees it,
+  `_filtered_clients()` does not). The config is read once in `Namer.__init__`,
+  so a running daemon needs restarting to pick that up. The shelf and triage
+  walk `Hyprland.toplevels` themselves and have no such filter, but neither can
+  ever see the proto: summoning either one closes it first.
+- `hl.dsp.window.close({ window = "address:0x.." })` -- the TABLE form, which
+  `Overlay.qml` already uses -- **does** honour the selector; verified by
+  closing a non-focused window and watching the focused one survive. The
+  positional-string form does not, and silently acts on the focused window
+  instead, which in a Claude Code session is the user's own terminal.
 
 ## The shelf
 
