@@ -71,6 +71,7 @@ rsync -a --delete \
   --exclude Overlay.qml \
   --exclude Triage.qml \
   --exclude Shelf.qml \
+  --exclude Proto.qml \
   --exclude Omnibox.js \
   --exclude phosphor-codepoints.json \
   --exclude fonts \
