@@ -18,6 +18,12 @@ import qs.Ui
 // see Triage.qml's header comment for why -- selected by root.triageMode,
 // which open() sets from the payload's "mode" field.
 //
+// ...and the shelf (Shelf.qml, {"mode":"shelf"}) and the tiled omnibox
+// (Proto.qml, {"mode":"proto"}) the same way. The proto is the odd one: it is
+// not a layer surface at all but a real XDG toplevel, so it TILES and the slot
+// it lands in is a live preview of where the next window will go. This Item's
+// own panel stays hidden for both.
+//
 // Lifecycle contract mirrors /usr/share/omarchy/shell/plugins/menu/Menu.qml
 // and plugins/clipboard/Clipboard.qml: open(payloadJson)/close()/ping(), and
 // every host-injected property below is PLAIN with a default, never
@@ -48,6 +54,12 @@ Item {
   // its own top-anchored PanelWindow rather than drawing inside the centred
   // card below, so this Item's panel stays hidden while it is up.
   property bool shelfMode: false
+  // The fourth: Proto.qml, the omnibox as a real TILED WINDOW
+  // ({"mode":"proto","target":"new"|"current"}). It is an XDG toplevel rather
+  // than a layer surface -- which is the only kind of surface a compositor
+  // will tile -- so it owns its own FloatingWindow and this Item's panel stays
+  // hidden, exactly as for the shelf.
+  property bool protoMode: false
   property string workspaceId: ""
   property int windowCount: -1
   // Fallback close-all target list, filled from `hyprctl -j clients` so the
@@ -89,8 +101,44 @@ Item {
     root.cursorActive = false
     root.selectedIndex = 0
 
+    // Summoning one mode while another is up used to leave the other one
+    // running, which was survivable while every mode was a layer surface that
+    // simply stopped being visible. The proto is a REAL WINDOW: left behind it
+    // is a window nobody summoned, sitting in somebody's layout. So each mode
+    // is told it is being replaced.
+    var wasTriage = root.triageMode
+    var wasShelf = root.shelfMode
+    var wasProto = root.protoMode
+
     root.triageMode = payload.mode === "triage"
     root.shelfMode = payload.mode === "shelf"
+    root.protoMode = payload.mode === "proto"
+
+    if (wasProto && !root.protoMode) protoView.close()
+    if (wasShelf && !root.shelfMode) shelfView.close()
+    if (wasTriage && !root.triageMode) triageView.close()
+    if (root.protoMode) {
+      root.workspaceId = ""
+      root.windowCount = -1
+      root.fallbackAddresses = []
+      root.suggestLoading = false
+      root.suggestFailed = false
+      root.suggestErrorText = ""
+      root.suggestedName = ""
+      root.suggestedIcon = ""
+      root.suggestedWindows = []
+      root.groups = []
+      // The whole payload: "target" (new|current), "query" and "profile".
+      protoView.open(payload)
+      // The proto's submap re-binds plain SUPER+<n> as well as swallowing
+      // SUPER+SHIFT+<n>, because a submap is exclusive -- see Proto.qml. It is
+      // defined at runtime, so it names itself; entering nothing at all is the
+      // right degradation if it has not been defined yet, since "literate-
+      // triage" would leave the workspace switch dead and point the digits at
+      // a view that is not open.
+      if (protoView.submapName) root.enterSubmap(protoView.submapName)
+      return
+    }
     if (root.shelfMode) {
       root.workspaceId = ""
       root.windowCount = -1
@@ -170,7 +218,9 @@ Item {
     if (suggestProc.running) suggestProc.running = false
     if (root.triageMode) triageView.close()
     if (root.shelfMode) shelfView.close()
+    if (root.protoMode) protoView.close()
     root.shelfMode = false
+    root.protoMode = false
     // Belt-and-braces: reset unconditionally on every close path (Escape,
     // Enter/activate, scrim click, IPC hide, this function in general).
     // Dispatching a submap reset when not in one is harmless, and being
@@ -229,6 +279,25 @@ Item {
   function shelfFocusPanel(arg) {
     if (!root.opened || !root.shelfMode) return "not in shelf"
     shelfView.select(1)
+    return "ok"
+  }
+
+  // Proto-only IPC entry points, same shape and same reason as the shelf's
+  // above: only this Item is the manifest entry point `omarchy-shell shell
+  // call` can address. The proto holds real keyboard focus as a toplevel, so
+  // these are also the only way to exercise its Enter path without a keyboard.
+  function protoQuery(text) {
+    if (!root.opened || !root.protoMode) return "not in proto"
+    protoView.setQuery(String(text === undefined ? "" : text))
+    return "ok"
+  }
+
+  // `omarchy-shell shell call` always passes an argument: "shift" picks the
+  // Shift half of the chord (the secondary Chrome profile), anything else the
+  // primary. The KEY decides the profile, never the row -- see Proto.qml.
+  function protoActivate(arg) {
+    if (!root.opened || !root.protoMode) return "not in proto"
+    protoView.activate(String(arg) === "shift")
     return "ok"
   }
 
@@ -600,9 +669,19 @@ Item {
     onCloseRequested: root.close()
   }
 
+  // The tiled omnibox ({"mode":"proto"}): a real XDG toplevel, so it is out
+  // here beside the shelf rather than inside the card below, and for the same
+  // reason -- two surfaces holding the keyboard would fight over the same
+  // keypresses. See Proto.qml for why a layer surface could not do this job.
+  Proto {
+    id: protoView
+    binPath: root.binPath
+    onCloseRequested: root.close()
+  }
+
   PanelWindow {
     id: panel
-    visible: root.opened && !root.shelfMode
+    visible: root.opened && !root.shelfMode && !root.protoMode
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "literate-overlay"
